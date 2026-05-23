@@ -1,12 +1,12 @@
 name: consume
 
-# Consume the three OpenINTEL Zonestream *_measurements Avro topics,
-# extract domain→IP / domain→NS observations, and publish per-day per-topic
-# gzipped JSONL files as Release assets.
+# Consume the three OpenINTEL Zonestream *_measurements Avro topics in
+# parallel shards (each shard = independent broker fetch quota → linear
+# speed-up). Extracts domain→IP / domain→NS observations to gzipped JSONL
+# and publishes per-day Release assets.
 #
-# Uses stable Kafka consumer groups so progress survives across runs.
-# Each run consumes up to ZS_RUN_SECONDS of wall-clock time per topic
-# (running all three topics in parallel via the matrix strategy).
+# Matrix: 3 topics × N shards. Each shard takes 1/N of the topic's offset
+# range over the chosen time window and runs an independent consumer.
 #
 # Schedule: daily at 00:30 UTC. Manual dispatch supported with overrides.
 
@@ -16,19 +16,23 @@ on:
   workflow_dispatch:
     inputs:
       run_seconds:
-        description: 'Wall-clock budget per topic (seconds)'
+        description: 'Wall-clock budget per shard (seconds; GH max 21600)'
         required: false
-        default: '18000'   # 5h ; GH Actions hard limit is 6h
+        default: '18000'
+      window_hours:
+        description: 'How many hours back from now to consume'
+        required: false
+        default: '24'
+      shard_count:
+        description: 'Shards per topic (each gets independent broker fetch quota)'
+        required: false
+        default: '3'
       max_msgs:
-        description: 'Per-topic message cap (0 = unlimited)'
+        description: 'Per-shard message cap (0 = unlimited)'
         required: false
         default: '0'
-      offset_reset:
-        description: 'On first connect for new consumer group: earliest | latest'
-        required: false
-        default: 'latest'
       group_suffix:
-        description: 'Optional consumer-group suffix; change to fork offsets'
+        description: 'Optional group suffix to fork from prior runs'
         required: false
         default: ''
 
@@ -40,12 +44,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 12
       matrix:
         topic:
           - newly_registered_domains_measurements
           - newly_registered_fqdn_measurements
           - newly_issued_certificates_measurements
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@v5
 
@@ -57,20 +62,19 @@ jobs:
         run: |
           pip install --quiet fastavro confluent-kafka
 
-      - name: Install kcat
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y kafkacat
-          which kcat || sudo ln -s "$(which kafkacat)" /usr/local/bin/kcat
-          kcat -V | head -1
-
       - name: Set window
         id: window
+        env:
+          WINDOW_HOURS: ${{ github.event.inputs.window_hours || '24' }}
         run: |
           DAY=$(date -u +%F)
+          NOW_MS=$(($(date +%s) * 1000))
+          START_MS=$((NOW_MS - WINDOW_HOURS * 3600 * 1000))
           echo "day=$DAY" >> $GITHUB_OUTPUT
-          echo "Topic: ${{ matrix.topic }}"
-          echo "Day:   $DAY"
+          echo "now_ms=$NOW_MS" >> $GITHUB_OUTPUT
+          echo "start_ms=$START_MS" >> $GITHUB_OUTPUT
+          echo "Topic: ${{ matrix.topic }}  Shard: ${{ matrix.shard }}  Day: $DAY"
+          echo "Window: $START_MS → $NOW_MS  (${WINDOW_HOURS}h)"
 
       - name: Consume + extract
         id: extract
@@ -78,24 +82,27 @@ jobs:
           KAFKA_BROKER: kafka.zonestream.openintel.nl:9092
           RUN_SECONDS: ${{ github.event.inputs.run_seconds || '18000' }}
           MAX_MSGS: ${{ github.event.inputs.max_msgs || '0' }}
-          OFFSET_RESET: ${{ github.event.inputs.offset_reset || 'latest' }}
+          SHARD_COUNT: ${{ github.event.inputs.shard_count || '3' }}
           GROUP_SUFFIX: ${{ github.event.inputs.group_suffix || '' }}
         run: |
-          mkdir -p observations/${{ steps.window.outputs.day }} samples/${{ steps.window.outputs.day }}
-          OBS="observations/${{ steps.window.outputs.day }}/${{ matrix.topic }}.jsonl.gz"
-          SAMPLE="samples/${{ steps.window.outputs.day }}/${{ matrix.topic }}.sample.jsonl.gz"
-          # Use a consumer-group consume so progress persists between runs
+          mkdir -p observations/${{ steps.window.outputs.day }} \
+                   samples/${{ steps.window.outputs.day }}
+          OBS="observations/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
+          SAMPLE="samples/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.sample.jsonl.gz"
+          GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
           python scripts/consume_group.py \
             --topic ${{ matrix.topic }} \
-            --group "gha-dns-tracking-${GITHUB_REPOSITORY##*/}-${{ matrix.topic }}${GROUP_SUFFIX}" \
+            --group "$GROUP" \
+            --start-ms ${{ steps.window.outputs.start_ms }} \
+            --end-ms ${{ steps.window.outputs.now_ms }} \
+            --shard-index ${{ matrix.shard }} \
+            --shard-count "$SHARD_COUNT" \
             --run-seconds "$RUN_SECONDS" \
             --max-msgs "$MAX_MSGS" \
-            --offset-reset "$OFFSET_RESET" \
-            --sample-n 200 \
+            --sample-n 100 \
             --out-obs "$OBS" \
             --out-sample "$SAMPLE"
           ls -lh "$OBS" "$SAMPLE"
-          # Capture stats for the release body
           echo "obs_size_bytes=$(stat -c %s "$OBS")" >> $GITHUB_OUTPUT
           echo "sample_size_bytes=$(stat -c %s "$SAMPLE")" >> $GITHUB_OUTPUT
           echo "obs_path=$OBS" >> $GITHUB_OUTPUT
@@ -107,19 +114,17 @@ jobs:
         run: |
           DAY=${{ steps.window.outputs.day }}
           TAG="snap-${DAY}"
-          # Create release if missing (idempotent)
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
               --title "DNS tracking ${DAY}" \
-              --notes "Per-topic observation streams extracted from OpenINTEL Zonestream measurement topics on ${DAY}."
-          # Upload (clobber to allow multi-run-per-day appends)
+              --notes "Per-topic per-shard observation streams extracted from OpenINTEL Zonestream measurement topics on ${DAY}."
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
             "${{ steps.extract.outputs.obs_path }}" \
             "${{ steps.extract.outputs.sample_path }}"
 
       - name: Job summary
         run: |
-          echo "### ${{ matrix.topic }} on ${{ steps.window.outputs.day }}" >> $GITHUB_STEP_SUMMARY
+          echo "### ${{ matrix.topic }} shard ${{ matrix.shard }} on ${{ steps.window.outputs.day }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- obs: $(numfmt --to=iec ${{ steps.extract.outputs.obs_size_bytes }})" >> $GITHUB_STEP_SUMMARY
           echo "- sample: $(numfmt --to=iec ${{ steps.extract.outputs.sample_size_bytes }})" >> $GITHUB_STEP_SUMMARY
