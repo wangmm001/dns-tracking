@@ -125,7 +125,7 @@ def main():
         'fetch.message.max.bytes': 16*1024*1024,
         'max.partition.fetch.bytes': 16*1024*1024,
         # Large client-side queue so polling can drain decoded backlog
-        'queued.max.messages.kbytes': 2*1024*1024,   # 2 GiB
+        'queued.max.messages.kbytes': 1024*1024,     # 1 GiB (librdkafka caps at 2 GiB - 1)
         'queued.min.messages': 1_000_000,
         # Larger socket recv buffer (BDP for ~100 ms RTT × ~10 MB/s ≈ 1 MB,
         # set to 8 MB so kernel doesn't throttle)
