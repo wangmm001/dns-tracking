@@ -115,8 +115,23 @@ def main():
         'group.id': args.group,
         'auto.offset.reset': args.offset_reset,
         'enable.auto.commit': False,
+
+        # --- Fetch / network tuning for high-latency cross-region consume ---
+        # NL broker, US-hosted GH runners → ~80-100 ms RTT. Defaults
+        # (fetch.min.bytes=1) cap throughput at ~1 MB/s. Coalesce fetches
+        # into ~1 MB chunks so RTT is amortized.
+        'fetch.min.bytes': 1024*1024,        # wait for 1 MB or
+        'fetch.wait.max.ms': 500,            # 500 ms, whichever first
         'fetch.message.max.bytes': 16*1024*1024,
         'max.partition.fetch.bytes': 16*1024*1024,
+        # Large client-side queue so polling can drain decoded backlog
+        'queued.max.messages.kbytes': 2*1024*1024,   # 2 GiB
+        'queued.min.messages': 1_000_000,
+        # Larger socket recv buffer (BDP for ~100 ms RTT × ~10 MB/s ≈ 1 MB,
+        # set to 8 MB so kernel doesn't throttle)
+        'socket.receive.buffer.bytes': 8*1024*1024,
+
+        # Session / poll keepalives during long extracts
         'session.timeout.ms': 60000,
         'max.poll.interval.ms': 600000,
     }
