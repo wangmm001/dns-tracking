@@ -17,7 +17,8 @@ Consumption flow:
 
 Output:
 - --out-obs:    gzipped JSONL of observation records (kind: ip|ns|ns_ip|mx)
-- --out-sample: gzipped JSONL of first --sample-n full MeasurementResult dicts
+- --out-sample: (optional) gzipped JSONL of first --sample-n full
+                MeasurementResult dicts; skipped if absent or --sample-n=0
 
 Env:
 - KAFKA_BROKER  (default kafka.zonestream.openintel.nl:9092)
@@ -181,9 +182,9 @@ def main():
     ap.add_argument('--shard-count', type=int, default=1)
     ap.add_argument('--run-seconds', type=int, default=18000)
     ap.add_argument('--max-msgs', type=int, default=0)
-    ap.add_argument('--sample-n', type=int, default=200)
+    ap.add_argument('--sample-n', type=int, default=0)
     ap.add_argument('--out-obs', required=True)
-    ap.add_argument('--out-sample', required=True)
+    ap.add_argument('--out-sample', default=None)
     ap.add_argument('--idle-exit-seconds', type=int, default=30)
     args = ap.parse_args()
 
@@ -226,7 +227,8 @@ def main():
           f"this shard = [{shard_start}..{shard_end}) "
           f"({shard_end - shard_start:,} msgs)", flush=True)
 
-    sample_f = gzip.open(args.out_sample, 'wt', encoding='utf-8', compresslevel=4)
+    write_sample = args.sample_n > 0 and args.out_sample is not None
+    sample_f = gzip.open(args.out_sample, 'wt', encoding='utf-8', compresslevel=4) if write_sample else None
 
     # In-memory dedup: keyed by (kind, topic, ...identifying fields...);
     # value tracks first_ts/last_ts/n. Flushed to JSONL at the end.
@@ -284,7 +286,7 @@ def main():
                     print(f"decode error at offset={msg.offset()}: {e}", file=sys.stderr)
                 continue
 
-            if n_sample < args.sample_n:
+            if write_sample and n_sample < args.sample_n:
                 def default(o):
                     if hasattr(o, 'isoformat'): return o.isoformat()
                     if isinstance(o, bytes): return o.hex()
@@ -316,7 +318,8 @@ def main():
         with gzip.open(args.out_obs, 'wb', compresslevel=4) as obs_f:
             n_obs_written = flush_dedup(dedup, obs_f)
         print(f"[{args.topic} shard {args.shard_index}] wrote {n_obs_written:,} obs records", flush=True)
-        sample_f.close()
+        if sample_f is not None:
+            sample_f.close()
         consumer.close()
 
     elapsed = time.time() - start_t

@@ -91,10 +91,8 @@ jobs:
           SHARD_COUNT: ${{ github.event.inputs.shard_count || '3' }}
           GROUP_SUFFIX: ${{ github.event.inputs.group_suffix || '' }}
         run: |
-          mkdir -p observations/${{ steps.window.outputs.day }} \
-                   samples/${{ steps.window.outputs.day }}
+          mkdir -p observations/${{ steps.window.outputs.day }}
           OBS="observations/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
-          SAMPLE="samples/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.sample.jsonl.gz"
           GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
           python scripts/consume_group.py \
             --topic ${{ matrix.topic }} \
@@ -105,14 +103,10 @@ jobs:
             --shard-count "$SHARD_COUNT" \
             --run-seconds "$RUN_SECONDS" \
             --max-msgs "$MAX_MSGS" \
-            --sample-n 100 \
-            --out-obs "$OBS" \
-            --out-sample "$SAMPLE"
-          ls -lh "$OBS" "$SAMPLE"
+            --out-obs "$OBS"
+          ls -lh "$OBS"
           echo "obs_size_bytes=$(stat -c %s "$OBS")" >> $GITHUB_OUTPUT
-          echo "sample_size_bytes=$(stat -c %s "$SAMPLE")" >> $GITHUB_OUTPUT
           echo "obs_path=$OBS" >> $GITHUB_OUTPUT
-          echo "sample_path=$SAMPLE" >> $GITHUB_OUTPUT
 
       - name: Upload as Release asset
         env:
@@ -125,12 +119,10 @@ jobs:
               --title "DNS tracking ${DAY}" \
               --notes "Per-topic per-shard observation streams extracted from OpenINTEL Zonestream measurement topics on ${DAY}."
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
-            "${{ steps.extract.outputs.obs_path }}" \
-            "${{ steps.extract.outputs.sample_path }}"
+            "${{ steps.extract.outputs.obs_path }}"
 
       - name: Job summary
         run: |
           echo "### ${{ matrix.topic }} shard ${{ matrix.shard }} on ${{ steps.window.outputs.day }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- obs: $(numfmt --to=iec ${{ steps.extract.outputs.obs_size_bytes }})" >> $GITHUB_STEP_SUMMARY
-          echo "- sample: $(numfmt --to=iec ${{ steps.extract.outputs.sample_size_bytes }})" >> $GITHUB_STEP_SUMMARY
