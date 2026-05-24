@@ -5,13 +5,14 @@ name: consume
 # speed-up). Extracts domain→IP / domain→NS observations to gzipped JSONL
 # and publishes per-day Release assets.
 #
-# Matrix: per-topic shard counts sized to historical worst-case duration
-# so all topics finish in a similar wall-clock budget. Total parallel
-# job count stays ≤ 20 (GH Free public-repo concurrent-job ceiling).
+# Matrix: per-topic shard counts read from .github/shards.json (shared
+# with retry.yml). Sized so each topic's slowest shard finishes in a
+# similar wall-clock budget; total parallel job count stays ≤ 20
+# (GH Free public-repo concurrent-job ceiling).
 #
-#   newly_issued_certificates_measurements   3 shards  (fast topic)
-#   newly_registered_fqdn_measurements       4 shards  (medium)
-#   newly_registered_domains_measurements   13 shards  (slow, dominant)
+# The `plan` job emits the matrix; when invoked with a non-empty `targets`
+# input (e.g. by retry.yml) it runs only that subset, enabling per-shard
+# re-runs without re-doing finished work.
 #
 # Schedule: daily at 00:30 UTC. Manual dispatch supported with overrides.
 
@@ -36,6 +37,14 @@ on:
         description: 'Optional group suffix to fork from prior runs'
         required: false
         default: ''
+      targets:
+        description: 'Optional JSON array overriding the matrix; e.g. ''[{"topic":"newly_registered_domains_measurements","shard":3,"shard_count":13}]''. Empty = full matrix from .github/shards.json.'
+        required: false
+        default: ''
+      day:
+        description: 'Override the UTC date the run targets (YYYY-MM-DD). Empty = today UTC at job start. Use when re-driving an earlier day.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -47,37 +56,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan:
+    # Emit the matrix for the consume job. Default: full plan from
+    # .github/shards.json. When `targets` input is set, use it as-is so
+    # callers (e.g. retry.yml) can run any subset of (topic, shard, shard_count).
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: set
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGETS" ]; then
+            INCLUDE="$TARGETS"
+          else
+            INCLUDE=$(jq -c '[to_entries[] as $e | range(0; $e.value) | {topic: $e.key, shard: ., shard_count: $e.value}]' .github/shards.json)
+          fi
+          MATRIX=$(jq -nc --argjson inc "$INCLUDE" '{include: $inc}')
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Plan ($(echo "$INCLUDE" | jq 'length') jobs):"
+          echo "$INCLUDE" | jq
+
   consume:
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix:
-        include:
-          # Fast: certs avg ~43min/shard at 6-way; trim to 3 shards (~85min each).
-          - { topic: newly_issued_certificates_measurements, shard: 0, shard_count: 3 }
-          - { topic: newly_issued_certificates_measurements, shard: 1, shard_count: 3 }
-          - { topic: newly_issued_certificates_measurements, shard: 2, shard_count: 3 }
-          # Medium: fqdn avg ~55min/shard at 6-way; trim to 4 shards (~85min each).
-          - { topic: newly_registered_fqdn_measurements, shard: 0, shard_count: 4 }
-          - { topic: newly_registered_fqdn_measurements, shard: 1, shard_count: 4 }
-          - { topic: newly_registered_fqdn_measurements, shard: 2, shard_count: 4 }
-          - { topic: newly_registered_fqdn_measurements, shard: 3, shard_count: 4 }
-          # Slow: domains worst-case 240min/shard at 6-way; grow to 13 shards
-          # (~110min each, also halves single-asset size below 2GiB Release limit).
-          - { topic: newly_registered_domains_measurements, shard: 0,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 1,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 2,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 3,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 4,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 5,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 6,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 7,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 8,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 9,  shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 10, shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 11, shard_count: 13 }
-          - { topic: newly_registered_domains_measurements, shard: 12, shard_count: 13 }
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -93,11 +102,14 @@ jobs:
         id: window
         env:
           WINDOW_HOURS: ${{ github.event.inputs.window_hours || '24' }}
+          DAY_INPUT: ${{ github.event.inputs.day }}
         run: |
-          # Anchor the window to UTC midnight of the run date so consecutive
+          # Anchor the window to UTC midnight of the target day so consecutive
           # runs tile [D 00:00, D+1 00:00) with no overlap or gap, regardless
           # of cron-fire jitter. snap-DAY contains the 24h ending at DAY 00:00 UTC.
-          DAY=$(date -u +%F)
+          # `day` input overrides today's UTC date — used by retry.yml so a
+          # queued retry that crosses midnight still targets the intended day.
+          DAY="${DAY_INPUT:-$(date -u +%F)}"
           END_MS=$(($(date -u -d "${DAY}T00:00:00Z" +%s) * 1000))
           START_MS=$((END_MS - WINDOW_HOURS * 3600 * 1000))
           echo "day=$DAY" >> $GITHUB_OUTPUT

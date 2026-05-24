@@ -1,0 +1,102 @@
+name: retry-missing-shards
+
+# Scan today's snap-YYYY-MM-DD Release for shards listed in .github/shards.json
+# that didn't land (consume.yml job failed or got dropped), then re-dispatch
+# consume.yml targeting only the missing (topic, shard) pairs.
+#
+# Runs daily after the main consume window is expected to finish. Re-dispatch
+# enters consume.yml's `concurrency: consume` queue, so if the main run is
+# somehow still going, retry waits.
+
+on:
+  schedule:
+    # Main consume starts 00:30 UTC and (per shard rebalance) should finish
+    # within ~2h. 04:00 UTC gives margin.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      day:
+        description: 'UTC date to check (YYYY-MM-DD); empty = today UTC at retry-time'
+        required: false
+        default: ''
+      dry_run:
+        description: 'If "true", only print missing shards; do not dispatch consume.yml'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: retry-missing-shards
+  cancel-in-progress: false
+
+jobs:
+  scan-and-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute missing shards and dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAY_INPUT: ${{ github.event.inputs.day }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          DAY="${DAY_INPUT:-$(date -u +%F)}"
+          TAG="snap-${DAY}"
+          echo "Checking $TAG in $GITHUB_REPOSITORY"
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            EXISTING=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')
+          else
+            echo "Release $TAG does not exist — every shard counts as missing."
+            EXISTING='[]'
+          fi
+          echo "Existing assets: $EXISTING"
+
+          MISSING=$(jq -nc \
+            --slurpfile exp .github/shards.json \
+            --argjson have "$EXISTING" '
+            [
+              $exp[0] | to_entries[] as $e |
+              range(0; $e.value) as $i |
+              ($e.key + ".shard-" + ($i|tostring) + ".jsonl.gz") as $name |
+              if any($have[]; . == $name) then empty
+              else {topic: $e.key, shard: $i, shard_count: $e.value} end
+            ]')
+
+          COUNT=$(echo "$MISSING" | jq 'length')
+          echo "Missing: $COUNT shard(s)"
+          echo "$MISSING" | jq
+
+          {
+            echo "## Retry scan for ${TAG}"
+            echo ""
+            echo "- Missing shards: **${COUNT}**"
+            if [ "$COUNT" -gt 0 ]; then
+              echo ""
+              echo '```json'
+              echo "$MISSING" | jq
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "All shards present — nothing to retry."
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry_run=true — not dispatching."
+            exit 0
+          fi
+
+          gh workflow run consume.yml \
+            -R "$GITHUB_REPOSITORY" \
+            -f targets="$MISSING" \
+            -f day="$DAY"
+          echo "Dispatched consume.yml with targets ($COUNT shards) for day=$DAY"

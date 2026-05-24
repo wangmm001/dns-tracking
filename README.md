@@ -78,6 +78,18 @@ Each shard's observation stream is uploaded to a per-day Release
 (`snap-YYYY-MM-DD`) as `<topic>.shard-<N>.jsonl.gz`. Re-runs overwrite via
 `--clobber`.
 
+Shard counts live in [`.github/shards.json`](.github/shards.json), shared
+between `consume.yml` (plan job emits the matrix) and `retry.yml`.
+
+### Auto-retry
+
+`retry.yml` runs daily at 04:00 UTC. It scans `snap-$(date -u +%F)` for
+expected assets and, if any are missing, re-dispatches `consume.yml` with
+a `targets` input listing just the missing `(topic, shard, shard_count)`
+triples and a `day` input pinning the date (so a queued retry crossing
+midnight still targets the intended day). Manual dispatch supports a
+`dry_run` mode that only logs the missing list.
+
 ## Consume locally
 
 ```bash
