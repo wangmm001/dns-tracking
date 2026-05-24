@@ -72,13 +72,17 @@ jobs:
           fi
           echo "Existing assets: $EXISTING"
 
+          # File extension follows matrix.format — kept in sync with the
+          # case-statement in consume.yml. avro_dns writes Parquet now;
+          # JSON topics still gzipped JSONL.
           MISSING=$(jq -nc \
             --slurpfile exp .github/shards.json \
             --argjson have "$EXISTING" '
+            def ext(fmt): if fmt == "avro_dns" then ".parquet" else ".jsonl.gz" end;
             [
               $exp[0] | to_entries[] as $e |
               range(0; $e.value.shards) as $i |
-              ($e.key + ".shard-" + ($i|tostring) + ".jsonl.gz") as $name |
+              ($e.key + ".shard-" + ($i|tostring) + ext($e.value.format)) as $name |
               if any($have[]; . == $name) then empty
               else {topic: $e.key, shard: $i, shard_count: $e.value.shards, format: $e.value.format} end
             ]')

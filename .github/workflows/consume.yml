@@ -105,7 +105,7 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install --quiet fastavro confluent-kafka
+          pip install --quiet fastavro confluent-kafka pyarrow
 
       - name: Set window
         id: window
@@ -152,19 +152,24 @@ jobs:
         run: |
           OUTDIR="observations/${{ steps.window.outputs.day }}-${{ steps.window.outputs.hour }}"
           mkdir -p "$OUTDIR"
-          OBS="$OUTDIR/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
-          GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
-          # Dispatch to the format-appropriate consumer:
-          #   avro_dns  → consume_group.py extracts dedup'd DNS observations
-          #   json      → consume_json.py dumps raw JSONL verbatim
+          # Dispatch to the format-appropriate consumer and pick the output
+          # extension to match what the script writes. EXT must stay in sync
+          # with retry.yml's missing-shard detection (matching jq case).
+          #   avro_dns  → consume_group.py writes Parquet (zstd-3, dict-encoded);
+          #               dedup'd DNS observations, query with duckdb.
+          #   json      → consume_json.py writes gzipped JSONL verbatim.
           case "${{ matrix.format }}" in
             avro_dns)
-              SCRIPT=scripts/consume_group.py ;;
+              SCRIPT=scripts/consume_group.py
+              EXT=parquet ;;
             json)
-              SCRIPT=scripts/consume_json.py ;;
+              SCRIPT=scripts/consume_json.py
+              EXT=jsonl.gz ;;
             *)
               echo "Unknown matrix.format='${{ matrix.format }}'"; exit 1 ;;
           esac
+          OBS="$OUTDIR/${{ matrix.topic }}.shard-${{ matrix.shard }}.$EXT"
+          GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
           python "$SCRIPT" \
             --topic ${{ matrix.topic }} \
             --group "$GROUP" \

@@ -16,9 +16,10 @@ Consumption flow:
      coverage of the trailing part of this shard is lost).
 
 Output:
-- --out-obs:    gzipped JSONL of observation records (kind: ip|ns|ns_ip|mx)
-- --out-sample: (optional) gzipped JSONL of first --sample-n full
-                MeasurementResult dicts; skipped if absent or --sample-n=0
+- --out-obs:    Parquet (zstd-3, dict-encoded) — one row per unique
+                (kind, topic, key tuple) with first_ts/last_ts/n aggregates.
+                Use duckdb / pandas / Polars to query. See OBS_SCHEMA below
+                for column docs.
 
 Env:
 - KAFKA_BROKER  (default kafka.zonestream.openintel.nl:9092)
@@ -31,6 +32,8 @@ from pathlib import Path
 
 from fastavro import schemaless_reader, parse_schema
 from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 SCHEMA_PATH = Path(os.environ.get('SCHEMA_PATH',
@@ -103,45 +106,87 @@ def extract_from_msg(d, topic_tag, dedup):
     return n_new
 
 
-def flush_dedup(dedup, out_obs):
-    """Write the dedup dict as JSONL records, one per unique key."""
-    n = 0
+# Unified observation schema. Single 15-column shape; NULLs distinguish
+# kind-specific subsets. Short column names save column-statistics bytes;
+# Parquet dictionary encoding (default for strings) handles repeated short
+# values like 'ip', 'A', 'US', '13335' efficiently. Use OBS_SCHEMA for
+# downstream queries:
+#   k='ip'/'ns'/'ns_ip'/'mx' — record kind (filter first for correctness)
+#   topic='domains'/'fqdn'/'certs'
+#   d  — candidate domain (NULL when k='ns_ip')
+#   s  — NS hostname (k='ns' or 'ns_ip')
+#   m  — MX hostname (k='mx')
+#   q  — 'A'/'AAAA' (k='ip' or 'ns_ip')
+#   ip — IPv4/v6 address (k='ip' or 'ns_ip')
+#   a  — ASN as decimal string (OpenINTEL's native form)
+#   c  — ISO 3166-1 alpha-2 country code
+#   p  — IP prefix (CIDR)
+#   pr — MX preference (k='mx')
+#   tl — TTL (response_ttl)
+#   fs — first_ts (ms since epoch; earliest broker_ts within the window)
+#   ls — last_ts  (ms since epoch; latest)
+#   n  — count of raw observations represented by this row
+#   rc — DNS rcode (only set when non-zero)
+OBS_SCHEMA = pa.schema([
+    ('k',     pa.string()),
+    ('topic', pa.string()),
+    ('d',     pa.string()),
+    ('s',     pa.string()),
+    ('m',     pa.string()),
+    ('q',     pa.string()),
+    ('ip',    pa.string()),
+    ('a',     pa.string()),
+    ('c',     pa.string()),
+    ('p',     pa.string()),
+    ('pr',    pa.int64()),
+    ('tl',    pa.int64()),
+    ('fs',    pa.int64()),
+    ('ls',    pa.int64()),
+    ('n',     pa.int64()),
+    ('rc',    pa.int64()),
+])
+_COLS = [f.name for f in OBS_SCHEMA]
+
+
+def flush_dedup(dedup, out_path):
+    """Write the dedup dict to a Parquet file at out_path.
+
+    Single row group, zstd-3 + dictionary encoding. Each shard's dedup dict
+    fits comfortably in RAM (a few M rows for the largest topic), so a
+    one-shot write keeps the code simple and gives Parquet the largest
+    possible dictionary (best compression). Always writes a valid file —
+    even with zero rows — so downstream globs don't trip on missing files."""
+    cols = {col: [] for col in _COLS}
     for key, v in dedup.items():
         kind = key[0]
         if kind == 'ip':
             _, topic, domain, qtype, ip, rcode = key
-            rec = {'kind': 'ip', 'topic': topic, 'domain': domain,
-                   'qtype': qtype, 'ip': ip,
-                   'as': v.get('as'), 'country': v.get('country'),
-                   'prefix': v.get('prefix'), 'ttl': v.get('ttl'),
-                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
-            if rcode: rec['rcode'] = rcode
+            row = {'k': 'ip', 'topic': topic, 'd': domain, 'q': qtype, 'ip': ip,
+                   'a': v.get('as'), 'c': v.get('country'), 'p': v.get('prefix')}
         elif kind == 'ns_ip':
             _, topic, ns, qtype, ip, rcode = key
-            rec = {'kind': 'ns_ip', 'topic': topic, 'ns': ns,
-                   'qtype': qtype, 'ip': ip,
-                   'as': v.get('as'), 'country': v.get('country'),
-                   'prefix': v.get('prefix'), 'ttl': v.get('ttl'),
-                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
-            if rcode: rec['rcode'] = rcode
+            row = {'k': 'ns_ip', 'topic': topic, 's': ns, 'q': qtype, 'ip': ip,
+                   'a': v.get('as'), 'c': v.get('country'), 'p': v.get('prefix')}
         elif kind == 'ns':
             _, topic, domain, ns, rcode = key
-            rec = {'kind': 'ns', 'topic': topic, 'domain': domain, 'ns': ns,
-                   'ttl': v.get('ttl'),
-                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
-            if rcode: rec['rcode'] = rcode
+            row = {'k': 'ns', 'topic': topic, 'd': domain, 's': ns}
         elif kind == 'mx':
             _, topic, domain, mx, pref, rcode = key
-            rec = {'kind': 'mx', 'topic': topic, 'domain': domain, 'mx': mx,
-                   'preference': pref, 'ttl': v.get('ttl'),
-                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
-            if rcode: rec['rcode'] = rcode
+            row = {'k': 'mx', 'topic': topic, 'd': domain, 'm': mx, 'pr': pref}
         else:
             continue
-        rec = {k: vv for k, vv in rec.items() if vv is not None}
-        out_obs.write((json.dumps(rec, separators=(',', ':')) + '\n').encode())
-        n += 1
-    return n
+        row['tl'] = v.get('ttl')
+        row['fs'] = v['first_ts']
+        row['ls'] = v['last_ts']
+        row['n']  = v['n']
+        if rcode: row['rc'] = rcode
+        for col in _COLS:
+            cols[col].append(row.get(col))
+
+    tbl = pa.table(cols, schema=OBS_SCHEMA)
+    pq.write_table(tbl, out_path, compression='zstd', compression_level=3,
+                   use_dictionary=True)
+    return len(dedup)
 
 
 def compute_shard_range(consumer, topic, start_ms, end_ms, shard_idx, shard_count):
@@ -313,14 +358,20 @@ def main():
                 last_log_msgs = n_msgs
                 last_log_bytes = n_bytes
     finally:
-        # Flush dedup dict to JSONL output
+        # Flush dedup dict to Parquet. Always write (even on crash mid-consume)
+        # so the file is either fully valid (footer present) or doesn't exist.
+        # Parquet's all-or-nothing footer makes try/finally essential here.
         print(f"[{args.topic} shard {args.shard_index}] flushing {len(dedup):,} dedup keys to {args.out_obs}", flush=True)
-        with gzip.open(args.out_obs, 'wb', compresslevel=4) as obs_f:
-            n_obs_written = flush_dedup(dedup, obs_f)
-        print(f"[{args.topic} shard {args.shard_index}] wrote {n_obs_written:,} obs records", flush=True)
-        if sample_f is not None:
-            sample_f.close()
-        consumer.close()
+        try:
+            n_obs_written = flush_dedup(dedup, args.out_obs)
+            print(f"[{args.topic} shard {args.shard_index}] wrote {n_obs_written:,} obs records", flush=True)
+        except Exception as e:
+            print(f"[{args.topic} shard {args.shard_index}] PARQUET FLUSH FAILED: {e}", flush=True)
+            raise
+        finally:
+            if sample_f is not None:
+                sample_f.close()
+            consumer.close()
 
     elapsed = time.time() - start_t
     stats = {
