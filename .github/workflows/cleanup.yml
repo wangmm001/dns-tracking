@@ -1,0 +1,98 @@
+name: cleanup-old-releases
+
+# Rolling-window retention for snap-YYYY-MM-DD-HH releases. Each window is
+# ~1 GB across ~20 assets; without pruning the repo grows ~60 GB/month.
+# Deletes both the GitHub Release (assets + page) and the underlying git tag
+# for any snap whose date is older than `keep_days` days back (default 30).
+#
+# Schedule: daily at 06:00 UTC — sits between retry (04:30) and the next
+# consume (12:30), so it never races a release that's still being written.
+# Tags that don't match snap-YYYY-MM-DD-HH are ignored, so manual one-off
+# tags (e.g. `v*`) are safe.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      keep_days:
+        description: 'Retention window in days (releases older than this are deleted)'
+        required: false
+        default: '30'
+      dry_run:
+        description: 'If "true", only print what would be deleted; do not delete'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-old-releases
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete releases older than keep_days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_DAYS: ${{ github.event.inputs.keep_days || '30' }}
+          DRY_RUN:   ${{ github.event.inputs.dry_run   || 'false' }}
+        run: |
+          set -euo pipefail
+
+          TODAY=$(date -u +%F)
+          CUTOFF=$(date -u -d "${TODAY} - ${KEEP_DAYS} days" +%F)
+          echo "Today (UTC): $TODAY"
+          echo "Cutoff date: $CUTOFF (keep snaps with date >= cutoff)"
+          echo "Dry run: $DRY_RUN"
+
+          # -L 1000 covers >1 year of twice-daily snaps with headroom.
+          ALL=$(gh release list -R "$GITHUB_REPOSITORY" -L 1000 \
+                  --json tagName --jq '.[].tagName')
+
+          # Keep only snap-YYYY-MM-DD-HH tags whose YYYY-MM-DD < CUTOFF.
+          # YYYY-MM-DD is lexicographically date-ordered so string compare is
+          # correct.
+          OLD=$(echo "$ALL" | awk -v cutoff="$CUTOFF" '
+            /^snap-[0-9]{4}-[0-9]{2}-[0-9]{2}-(00|12)$/ {
+              if (substr($0, 6, 10) < cutoff) print $0
+            }' | sort)
+
+          COUNT=$(echo -n "$OLD" | grep -c . || true)
+          echo "Found $COUNT release(s) older than $CUTOFF"
+          [ "$COUNT" -gt 0 ] && echo "$OLD"
+
+          {
+            echo "## Release cleanup"
+            echo ""
+            echo "- Today (UTC): \`${TODAY}\`"
+            echo "- Cutoff: \`${CUTOFF}\` (keep_days=${KEEP_DAYS})"
+            echo "- Releases to delete: **${COUNT}**"
+            echo "- Dry run: \`${DRY_RUN}\`"
+            if [ "$COUNT" -gt 0 ]; then
+              echo ""
+              echo '```'
+              echo "$OLD"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nothing to prune."; exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry_run=true — not deleting."; exit 0
+          fi
+
+          # --cleanup-tag removes the git tag along with the release.
+          echo "$OLD" | while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
+            echo "Deleting $TAG (release + tag)…"
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" \
+              --cleanup-tag --yes
+          done
+
+          echo "Pruned $COUNT release(s)."

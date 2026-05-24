@@ -165,6 +165,16 @@ topic JOIN 一行 SQL 搞定**。
 窗口（防止排队的 retry 跨越边界时打错窗口）。手动 dispatch 支持
 `dry_run`，只打印缺失列表不发起补跑。
 
+### 滚动清理
+
+`cleanup.yml` 每天 **06:00 UTC** 跑（卡在 `retry.yml` 之后、下一次
+`consume.yml` 之前，不会跟还在写入的 release 撞车）。它列出所有匹配
+`snap-YYYY-MM-DD-HH` 的 tag，解析里头的日期，把超过 **30 天**的
+release 全部删掉 —— GitHub Release（asset + 页面）和对应的 git tag 一起
+清（`gh release delete --cleanup-tag`）。非 `snap-*` 的 tag 不动。手动
+dispatch 支持 `keep_days`（默认 `30`）和 `dry_run`（默认 `false`），后者
+只打印会被删的列表，不实际动手。
+
 ## 查询
 
 推荐用 [DuckDB](https://duckdb.org)：原生读 Parquet，支持 HTTP 直读

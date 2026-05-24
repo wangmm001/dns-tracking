@@ -179,6 +179,17 @@ pinning the window (so a queued retry crossing a boundary still targets
 the intended one). Manual dispatch supports a `dry_run` mode that only
 logs the missing list.
 
+### Rolling cleanup
+
+`cleanup.yml` runs daily at **06:00 UTC** (between `retry.yml` and the
+next `consume.yml`, so it never races a release mid-write). It lists
+every tag matching `snap-YYYY-MM-DD-HH`, parses the embedded date, and
+deletes any release whose date is older than **30 days** back — both the
+GitHub Release (assets + page) and the underlying git tag
+(`gh release delete --cleanup-tag`). Non-`snap-*` tags are left alone.
+Manual dispatch accepts `keep_days` (default `30`) and `dry_run`
+(default `false`) for previewing what would be deleted.
+
 ## Querying
 
 We recommend [DuckDB](https://duckdb.org) — it reads Parquet natively,
