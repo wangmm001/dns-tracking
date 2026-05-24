@@ -152,23 +152,16 @@ jobs:
         run: |
           OUTDIR="observations/${{ steps.window.outputs.day }}-${{ steps.window.outputs.hour }}"
           mkdir -p "$OUTDIR"
-          # Dispatch to the format-appropriate consumer and pick the output
-          # extension to match what the script writes. EXT must stay in sync
-          # with retry.yml's missing-shard detection (matching jq case).
-          #   avro_dns  → consume_group.py writes Parquet (zstd-3, dict-encoded);
-          #               dedup'd DNS observations, query with duckdb.
-          #   json      → consume_json.py writes gzipped JSONL verbatim.
+          # Dispatch to the format-appropriate consumer; both produce Parquet
+          # (zstd-3, dict-encoded). avro_dns extracts dedup'd DNS observations;
+          # json parses the raw JSON payload into a per-topic schema. Identical
+          # output extension keeps retry.yml's filename detection trivial.
           case "${{ matrix.format }}" in
-            avro_dns)
-              SCRIPT=scripts/consume_group.py
-              EXT=parquet ;;
-            json)
-              SCRIPT=scripts/consume_json.py
-              EXT=jsonl.gz ;;
-            *)
-              echo "Unknown matrix.format='${{ matrix.format }}'"; exit 1 ;;
+            avro_dns) SCRIPT=scripts/consume_group.py ;;
+            json)     SCRIPT=scripts/consume_json.py ;;
+            *) echo "Unknown matrix.format='${{ matrix.format }}'"; exit 1 ;;
           esac
-          OBS="$OUTDIR/${{ matrix.topic }}.shard-${{ matrix.shard }}.$EXT"
+          OBS="$OUTDIR/${{ matrix.topic }}.shard-${{ matrix.shard }}.parquet"
           GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
           python "$SCRIPT" \
             --topic ${{ matrix.topic }} \
