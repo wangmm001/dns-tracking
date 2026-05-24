@@ -1,5 +1,7 @@
 # dns-tracking
 
+English README (this file) · [中文版](README.zh.md)
+
 Long-term tracking of newly registered domains' DNS state (IP, NS, MX, AS,
 country) sourced from [OpenINTEL Zonestream's][1] reactive measurement Avro
 streams ([DarkDNS][2], IMC '24).
