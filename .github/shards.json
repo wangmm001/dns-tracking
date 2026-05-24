@@ -1,5 +1,6 @@
 {
-  "newly_issued_certificates_measurements": 3,
-  "newly_registered_fqdn_measurements": 4,
-  "newly_registered_domains_measurements": 13
+  "newly_issued_certificates_measurements": { "shards": 3,  "format": "avro_dns" },
+  "newly_registered_fqdn_measurements":     { "shards": 4,  "format": "avro_dns" },
+  "newly_registered_domains_measurements":  { "shards": 11, "format": "avro_dns" },
+  "certstream_domains":                     { "shards": 2,  "format": "json"     }
 }

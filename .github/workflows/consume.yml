@@ -1,14 +1,16 @@
 name: consume
 
-# Consume the three OpenINTEL Zonestream *_measurements Avro topics in
-# parallel shards (each shard = independent broker fetch quota → linear
-# speed-up). Extracts domain→IP / domain→NS observations to gzipped JSONL
-# and publishes per-day Release assets.
+# Consume OpenINTEL Zonestream topics in parallel shards (each shard =
+# independent broker fetch quota → linear speed-up). Publishes per-day
+# Release assets — extracted DNS observations (Avro topics) or raw JSONL
+# (JSON topics).
 #
-# Matrix: per-topic shard counts read from .github/shards.json (shared
-# with retry.yml). Sized so each topic's slowest shard finishes in a
-# similar wall-clock budget; total parallel job count stays ≤ 20
-# (GH Free public-repo concurrent-job ceiling).
+# Matrix: per-topic config in .github/shards.json (shared with retry.yml).
+# Each entry has `shards` (count) and `format` (`avro_dns` → script
+# consume_group.py with DNS extraction, `json` → consume_json.py raw dump).
+# Sized so each topic's slowest shard finishes within a similar wall-clock
+# budget and total parallel job count stays ≤ 20 (GH Free public-repo
+# concurrent-job ceiling).
 #
 # The `plan` job emits the matrix; when invoked with a non-empty `targets`
 # input (e.g. by retry.yml) it runs only that subset, enabling per-shard
@@ -38,7 +40,7 @@ on:
         required: false
         default: ''
       targets:
-        description: 'Optional JSON array overriding the matrix; e.g. ''[{"topic":"newly_registered_domains_measurements","shard":3,"shard_count":13}]''. Empty = full matrix from .github/shards.json.'
+        description: 'Optional JSON array overriding the matrix; e.g. ''[{"topic":"newly_registered_domains_measurements","shard":3,"shard_count":11,"format":"avro_dns"}]''. Each entry needs topic/shard/shard_count/format. Empty = full matrix from .github/shards.json.'
         required: false
         default: ''
       day:
@@ -73,7 +75,7 @@ jobs:
           if [ -n "$TARGETS" ]; then
             INCLUDE="$TARGETS"
           else
-            INCLUDE=$(jq -c '[to_entries[] as $e | range(0; $e.value) | {topic: $e.key, shard: ., shard_count: $e.value}]' .github/shards.json)
+            INCLUDE=$(jq -c '[to_entries[] as $e | range(0; $e.value.shards) | {topic: $e.key, shard: ., shard_count: $e.value.shards, format: $e.value.format}]' .github/shards.json)
           fi
           MATRIX=$(jq -nc --argjson inc "$INCLUDE" '{include: $inc}')
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
@@ -130,7 +132,18 @@ jobs:
           mkdir -p observations/${{ steps.window.outputs.day }}
           OBS="observations/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
           GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
-          python scripts/consume_group.py \
+          # Dispatch to the format-appropriate consumer:
+          #   avro_dns  → consume_group.py extracts dedup'd DNS observations
+          #   json      → consume_json.py dumps raw JSONL verbatim
+          case "${{ matrix.format }}" in
+            avro_dns)
+              SCRIPT=scripts/consume_group.py ;;
+            json)
+              SCRIPT=scripts/consume_json.py ;;
+            *)
+              echo "Unknown matrix.format='${{ matrix.format }}'"; exit 1 ;;
+          esac
+          python "$SCRIPT" \
             --topic ${{ matrix.topic }} \
             --group "$GROUP" \
             --start-ms ${{ steps.window.outputs.start_ms }} \

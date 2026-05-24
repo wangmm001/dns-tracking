@@ -61,32 +61,44 @@ Compression: ~10-15 GB/day total across all three topics.
 **matrix strategy** with per-topic shard counts sized to historical worst-case
 duration, so all topics finish in roughly the same wall-clock budget:
 
-| topic                                    | shards | group id (one per shard)                                       |
-|------------------------------------------|-------:|----------------------------------------------------------------|
-| `newly_issued_certificates_measurements` |      3 | `gha-dns-tracking-<topic>-shard{0..2}`                         |
-| `newly_registered_fqdn_measurements`     |      4 | `gha-dns-tracking-<topic>-shard{0..3}`                         |
-| `newly_registered_domains_measurements`  |     13 | `gha-dns-tracking-<topic>-shard{0..12}`                        |
+| topic                                    | format     | shards |
+|------------------------------------------|------------|-------:|
+| `newly_issued_certificates_measurements` | `avro_dns` |      3 |
+| `newly_registered_fqdn_measurements`     | `avro_dns` |      4 |
+| `newly_registered_domains_measurements`  | `avro_dns` |     11 |
+| `certstream_domains`                     | `json`     |      2 |
 
-Total 20 parallel jobs (GH Free public-repo concurrent-job ceiling). Each
-shard takes 1/N of the topic's offset range over a deterministic window
+Total 20 parallel jobs (GH Free public-repo concurrent-job ceiling). The
+`format` selects the per-shard consumer:
+
+- **`avro_dns`** → `scripts/consume_group.py` decodes the Avro
+  `MeasurementResult` records and extracts dedup'd DNS observations
+  (`kind`: ip / ns / mx / ns_ip).
+- **`json`** → `scripts/consume_json.py` validates each payload as JSON and
+  appends it verbatim to a gzipped JSONL file (no transform). Used for the
+  cert↔domain mapping stream, which we want to preserve in full for joining
+  with the measurement records via `certIndex` / `fingerprint`.
+
+Each shard takes 1/N of the topic's offset range over a deterministic window
 anchored to `[DAY 00:00 UTC − 24h, DAY 00:00 UTC)`, so consecutive runs tile
-the timeline with no overlap or gap. The script uses `assign()+seek()` and
-does NOT commit offsets — the group id is only a label that gives each
-shard an independent broker-side fetch quota.
+the timeline with no overlap or gap. Scripts use `assign()+seek()` and do
+NOT commit offsets — the group id (one per shard) is only a label that gives
+each shard an independent broker-side fetch quota.
 
 Each shard's observation stream is uploaded to a per-day Release
 (`snap-YYYY-MM-DD`) as `<topic>.shard-<N>.jsonl.gz`. Re-runs overwrite via
 `--clobber`.
 
-Shard counts live in [`.github/shards.json`](.github/shards.json), shared
-between `consume.yml` (plan job emits the matrix) and `retry.yml`.
+Topic config (shard count + format) lives in
+[`.github/shards.json`](.github/shards.json), shared between `consume.yml`
+(plan job emits the matrix) and `retry.yml`.
 
 ### Auto-retry
 
 `retry.yml` runs daily at 04:00 UTC. It scans `snap-$(date -u +%F)` for
 expected assets and, if any are missing, re-dispatches `consume.yml` with
-a `targets` input listing just the missing `(topic, shard, shard_count)`
-triples and a `day` input pinning the date (so a queued retry crossing
+a `targets` input listing just the missing `(topic, shard, shard_count, format)`
+entries plus a `day` input pinning the date (so a queued retry crossing
 midnight still targets the intended day). Manual dispatch supports a
 `dry_run` mode that only logs the missing list.
 

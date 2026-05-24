@@ -63,10 +63,10 @@ jobs:
             --argjson have "$EXISTING" '
             [
               $exp[0] | to_entries[] as $e |
-              range(0; $e.value) as $i |
+              range(0; $e.value.shards) as $i |
               ($e.key + ".shard-" + ($i|tostring) + ".jsonl.gz") as $name |
               if any($have[]; . == $name) then empty
-              else {topic: $e.key, shard: $i, shard_count: $e.value} end
+              else {topic: $e.key, shard: $i, shard_count: $e.value.shards, format: $e.value.format} end
             ]')
 
           COUNT=$(echo "$MISSING" | jq 'length')
