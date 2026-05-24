@@ -5,8 +5,13 @@ name: consume
 # speed-up). Extracts domain→IP / domain→NS observations to gzipped JSONL
 # and publishes per-day Release assets.
 #
-# Matrix: 3 topics × N shards. Each shard takes 1/N of the topic's offset
-# range over the chosen time window and runs an independent consumer.
+# Matrix: per-topic shard counts sized to historical worst-case duration
+# so all topics finish in a similar wall-clock budget. Total parallel
+# job count stays ≤ 20 (GH Free public-repo concurrent-job ceiling).
+#
+#   newly_issued_certificates_measurements   3 shards  (fast topic)
+#   newly_registered_fqdn_measurements       4 shards  (medium)
+#   newly_registered_domains_measurements   13 shards  (slow, dominant)
 #
 # Schedule: daily at 00:30 UTC. Manual dispatch supported with overrides.
 
@@ -23,10 +28,6 @@ on:
         description: 'How many hours back from now to consume'
         required: false
         default: '24'
-      shard_count:
-        description: 'Shards per topic (each gets independent broker fetch quota); must match matrix.shard length'
-        required: false
-        default: '6'
       max_msgs:
         description: 'Per-shard message cap (0 = unlimited)'
         required: false
@@ -50,13 +51,33 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 18
+      max-parallel: 20
       matrix:
-        topic:
-          - newly_registered_domains_measurements
-          - newly_registered_fqdn_measurements
-          - newly_issued_certificates_measurements
-        shard: [0, 1, 2, 3, 4, 5]
+        include:
+          # Fast: certs avg ~43min/shard at 6-way; trim to 3 shards (~85min each).
+          - { topic: newly_issued_certificates_measurements, shard: 0, shard_count: 3 }
+          - { topic: newly_issued_certificates_measurements, shard: 1, shard_count: 3 }
+          - { topic: newly_issued_certificates_measurements, shard: 2, shard_count: 3 }
+          # Medium: fqdn avg ~55min/shard at 6-way; trim to 4 shards (~85min each).
+          - { topic: newly_registered_fqdn_measurements, shard: 0, shard_count: 4 }
+          - { topic: newly_registered_fqdn_measurements, shard: 1, shard_count: 4 }
+          - { topic: newly_registered_fqdn_measurements, shard: 2, shard_count: 4 }
+          - { topic: newly_registered_fqdn_measurements, shard: 3, shard_count: 4 }
+          # Slow: domains worst-case 240min/shard at 6-way; grow to 13 shards
+          # (~110min each, also halves single-asset size below 2GiB Release limit).
+          - { topic: newly_registered_domains_measurements, shard: 0,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 1,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 2,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 3,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 4,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 5,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 6,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 7,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 8,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 9,  shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 10, shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 11, shard_count: 13 }
+          - { topic: newly_registered_domains_measurements, shard: 12, shard_count: 13 }
     steps:
       - uses: actions/checkout@v5
 
@@ -91,7 +112,7 @@ jobs:
           KAFKA_BROKER: kafka.zonestream.openintel.nl:9092
           RUN_SECONDS: ${{ github.event.inputs.run_seconds || '18000' }}
           MAX_MSGS: ${{ github.event.inputs.max_msgs || '0' }}
-          SHARD_COUNT: ${{ github.event.inputs.shard_count || '3' }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
           GROUP_SUFFIX: ${{ github.event.inputs.group_suffix || '' }}
         run: |
           mkdir -p observations/${{ steps.window.outputs.day }}

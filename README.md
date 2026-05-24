@@ -58,32 +58,25 @@ Compression: ~10-15 GB/day total across all three topics.
 ## How it works
 
 `consume.yml` runs daily at 00:30 UTC (and on manual dispatch). It uses a
-**matrix strategy** to consume all three topics in parallel — three jobs, each
-with its own stable Kafka consumer group:
+**matrix strategy** with per-topic shard counts sized to historical worst-case
+duration, so all topics finish in roughly the same wall-clock budget:
 
-```
-gha-dns-tracking-dns-tracking-newly_registered_domains_measurements
-gha-dns-tracking-dns-tracking-newly_registered_fqdn_measurements
-gha-dns-tracking-dns-tracking-newly_issued_certificates_measurements
-```
+| topic                                    | shards | group id (one per shard)                                       |
+|------------------------------------------|-------:|----------------------------------------------------------------|
+| `newly_issued_certificates_measurements` |      3 | `gha-dns-tracking-<topic>-shard{0..2}`                         |
+| `newly_registered_fqdn_measurements`     |      4 | `gha-dns-tracking-<topic>-shard{0..3}`                         |
+| `newly_registered_domains_measurements`  |     13 | `gha-dns-tracking-<topic>-shard{0..12}`                        |
 
-The broker remembers our last committed offset per group, so each run picks
-up where the previous left off. A run consumes for up to 5 hours of
-wall-clock time (under the 6-hour GH Actions per-job limit), commits offsets
-on shutdown, and uploads the day's observation files as Release assets
-(`--clobber`, so multi-run-per-day appends just overwrite the asset with the
-accumulated content).
+Total 20 parallel jobs (GH Free public-repo concurrent-job ceiling). Each
+shard takes 1/N of the topic's offset range over a deterministic window
+anchored to `[DAY 00:00 UTC − 24h, DAY 00:00 UTC)`, so consecutive runs tile
+the timeline with no overlap or gap. The script uses `assign()+seek()` and
+does NOT commit offsets — the group id is only a label that gives each
+shard an independent broker-side fetch quota.
 
-## Bootstrap (first run)
-
-Manual dispatch with `offset_reset: latest` and the default 5-hour budget:
-this starts the consumer groups at the broker high-water-mark and consumes
-~5 hours of fresh data. Daily cron continues from there.
-
-For backfill (consume from earliest available, which on this broker is
-~28 days ago), dispatch with `offset_reset: earliest` — but be aware total
-data over 28 days is enormous, and you almost certainly want `max_msgs` to
-cap the bootstrap or break it across several runs.
+Each shard's observation stream is uploaded to a per-day Release
+(`snap-YYYY-MM-DD`) as `<topic>.shard-<N>.jsonl.gz`. Re-runs overwrite via
+`--clobber`.
 
 ## Consume locally
 
