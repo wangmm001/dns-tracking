@@ -43,52 +43,101 @@ TOPIC_ABBR = {
 }
 
 
-def extract_from_msg(d, topic_tag, out_obs):
-    """Pull observations out of one decoded MeasurementResult dict; return count."""
+def extract_from_msg(d, topic_tag, dedup):
+    """Pull observations out of one decoded MeasurementResult dict into a
+    per-(kind, key) dedup dict. The dedup value tracks first/last ts and count.
+    Returns number of NEW dedup entries created."""
     domain = (d.get('id') or '').rstrip('.')
     if not domain:
         return 0
     rows = d.get('resultList') or []
-    n = 0
+    n_new = 0
     for r in rows:
         qtype = r.get('query_type')
         qname = (r.get('query_name') or '').rstrip('.')
         ts = r.get('timestamp')
-        rcode = r.get('status_code')
+        rcode = r.get('status_code') or 0
         ttl = r.get('response_ttl')
         is_primary = (qname == domain) if qname else False
+
+        key = None
+        extras = None
 
         if qtype == 'A' or qtype == 'AAAA':
             ip = r.get('ip4_address') or r.get('ip6_address')
             if ip is None:
                 continue
-            rec = {
-                'kind': 'ip' if is_primary else 'ns_ip',
-                'ts': ts, 'topic': topic_tag,
-                'domain': domain if is_primary else None,
-                'ns': qname if not is_primary else None,
-                'qtype': qtype, 'ip': ip,
-                'as': r.get('as'), 'country': r.get('country'),
-                'prefix': r.get('ip_prefix'),
-                'ttl': ttl, 'rtt': r.get('rtt'), 'rcode': rcode,
-            }
+            if is_primary:
+                key = ('ip', topic_tag, domain, qtype, ip, rcode)
+                extras = {'as': r.get('as'), 'country': r.get('country'),
+                          'prefix': r.get('ip_prefix')}
+            else:
+                key = ('ns_ip', topic_tag, qname, qtype, ip, rcode)
+                extras = {'as': r.get('as'), 'country': r.get('country'),
+                          'prefix': r.get('ip_prefix')}
         elif qtype == 'NS' and is_primary:
             ns = (r.get('ns_address') or '').rstrip('.')
             if not ns:
                 continue
-            rec = {'kind': 'ns', 'ts': ts, 'topic': topic_tag,
-                   'domain': domain, 'ns': ns, 'ttl': ttl, 'rcode': rcode}
+            key = ('ns', topic_tag, domain, ns, rcode)
+            extras = {}
         elif qtype == 'MX' and is_primary:
             mx = (r.get('mx_address') or '').rstrip('.')
             if not mx:
                 continue
-            rec = {'kind': 'mx', 'ts': ts, 'topic': topic_tag,
-                   'domain': domain, 'mx': mx,
-                   'preference': r.get('mx_preference'), 'ttl': ttl, 'rcode': rcode}
+            key = ('mx', topic_tag, domain, mx, r.get('mx_preference'), rcode)
+            extras = {}
         else:
             continue
 
-        rec = {k: v for k, v in rec.items() if v is not None}
+        entry = dedup.get(key)
+        if entry is None:
+            dedup[key] = {'first_ts': ts, 'last_ts': ts, 'n': 1,
+                          'ttl': ttl, **(extras or {})}
+            n_new += 1
+        else:
+            if ts < entry['first_ts']: entry['first_ts'] = ts
+            if ts > entry['last_ts']:  entry['last_ts']  = ts
+            entry['n'] += 1
+    return n_new
+
+
+def flush_dedup(dedup, out_obs):
+    """Write the dedup dict as JSONL records, one per unique key."""
+    n = 0
+    for key, v in dedup.items():
+        kind = key[0]
+        if kind == 'ip':
+            _, topic, domain, qtype, ip, rcode = key
+            rec = {'kind': 'ip', 'topic': topic, 'domain': domain,
+                   'qtype': qtype, 'ip': ip,
+                   'as': v.get('as'), 'country': v.get('country'),
+                   'prefix': v.get('prefix'), 'ttl': v.get('ttl'),
+                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
+            if rcode: rec['rcode'] = rcode
+        elif kind == 'ns_ip':
+            _, topic, ns, qtype, ip, rcode = key
+            rec = {'kind': 'ns_ip', 'topic': topic, 'ns': ns,
+                   'qtype': qtype, 'ip': ip,
+                   'as': v.get('as'), 'country': v.get('country'),
+                   'prefix': v.get('prefix'), 'ttl': v.get('ttl'),
+                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
+            if rcode: rec['rcode'] = rcode
+        elif kind == 'ns':
+            _, topic, domain, ns, rcode = key
+            rec = {'kind': 'ns', 'topic': topic, 'domain': domain, 'ns': ns,
+                   'ttl': v.get('ttl'),
+                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
+            if rcode: rec['rcode'] = rcode
+        elif kind == 'mx':
+            _, topic, domain, mx, pref, rcode = key
+            rec = {'kind': 'mx', 'topic': topic, 'domain': domain, 'mx': mx,
+                   'preference': pref, 'ttl': v.get('ttl'),
+                   'first_ts': v['first_ts'], 'last_ts': v['last_ts'], 'n': v['n']}
+            if rcode: rec['rcode'] = rcode
+        else:
+            continue
+        rec = {k: vv for k, vv in rec.items() if vv is not None}
         out_obs.write((json.dumps(rec, separators=(',', ':')) + '\n').encode())
         n += 1
     return n
@@ -177,8 +226,11 @@ def main():
           f"this shard = [{shard_start}..{shard_end}) "
           f"({shard_end - shard_start:,} msgs)", flush=True)
 
-    obs_f = gzip.open(args.out_obs, 'wb', compresslevel=4)
     sample_f = gzip.open(args.out_sample, 'wt', encoding='utf-8', compresslevel=4)
+
+    # In-memory dedup: keyed by (kind, topic, ...identifying fields...);
+    # value tracks first_ts/last_ts/n. Flushed to JSONL at the end.
+    dedup = {}
 
     n_msgs = n_obs = n_sample = n_errors = 0
     n_bytes = 0
@@ -242,7 +294,7 @@ def main():
                                            **d}, default=default, ensure_ascii=False) + '\n')
                 n_sample += 1
 
-            n_obs += extract_from_msg(d, topic_tag, obs_f)
+            n_obs += extract_from_msg(d, topic_tag, dedup)
 
             now = time.time()
             if now - last_log_t >= 10.0:
@@ -251,21 +303,26 @@ def main():
                 mbps = (n_bytes - last_log_bytes) / dt / 1024 / 1024
                 # Progress through shard
                 pct = 100 * (msg.offset() - shard_start) / max(shard_end - shard_start, 1)
-                print(f"[{args.topic} shard {args.shard_index}] msgs={n_msgs:,} obs={n_obs:,} "
-                      f"sample={n_sample}  rate={rate:,.0f}/s ({mbps:.1f}MB/s)  "
+                print(f"[{args.topic} shard {args.shard_index}] msgs={n_msgs:,} "
+                      f"dedup_keys={len(dedup):,} sample={n_sample}  "
+                      f"rate={rate:,.0f}/s ({mbps:.1f}MB/s)  "
                       f"shard_progress={pct:.1f}% elapsed={now-start_t:.0f}s", flush=True)
                 last_log_t = now
                 last_log_msgs = n_msgs
                 last_log_bytes = n_bytes
     finally:
-        obs_f.close()
+        # Flush dedup dict to JSONL output
+        print(f"[{args.topic} shard {args.shard_index}] flushing {len(dedup):,} dedup keys to {args.out_obs}", flush=True)
+        with gzip.open(args.out_obs, 'wb', compresslevel=4) as obs_f:
+            n_obs_written = flush_dedup(dedup, obs_f)
+        print(f"[{args.topic} shard {args.shard_index}] wrote {n_obs_written:,} obs records", flush=True)
         sample_f.close()
         consumer.close()
 
     elapsed = time.time() - start_t
     stats = {
         'topic': args.topic, 'shard_index': args.shard_index, 'shard_count': args.shard_count,
-        'group': args.group, 'msgs': n_msgs, 'obs': n_obs,
+        'group': args.group, 'msgs': n_msgs, 'dedup_keys': len(dedup),
         'sample': n_sample, 'errors': n_errors, 'bytes_in': n_bytes,
         'elapsed_sec': round(elapsed, 1),
         'avg_msgs_per_sec': round(n_msgs / max(elapsed, 1), 1),
@@ -274,6 +331,7 @@ def main():
         'shard_msgs_total': shard_end - shard_start,
         'shard_msgs_covered': n_msgs,
         'shard_coverage_pct': round(100 * n_msgs / max(shard_end - shard_start, 1), 2),
+        'compression_ratio': round(n_obs / max(len(dedup), 1), 1),
         'done_reason': done_reason,
     }
     print(json.dumps(stats, indent=2))
