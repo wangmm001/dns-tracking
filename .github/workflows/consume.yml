@@ -73,14 +73,17 @@ jobs:
         env:
           WINDOW_HOURS: ${{ github.event.inputs.window_hours || '24' }}
         run: |
+          # Anchor the window to UTC midnight of the run date so consecutive
+          # runs tile [D 00:00, D+1 00:00) with no overlap or gap, regardless
+          # of cron-fire jitter. snap-DAY contains the 24h ending at DAY 00:00 UTC.
           DAY=$(date -u +%F)
-          NOW_MS=$(($(date +%s) * 1000))
-          START_MS=$((NOW_MS - WINDOW_HOURS * 3600 * 1000))
+          END_MS=$(($(date -u -d "${DAY}T00:00:00Z" +%s) * 1000))
+          START_MS=$((END_MS - WINDOW_HOURS * 3600 * 1000))
           echo "day=$DAY" >> $GITHUB_OUTPUT
-          echo "now_ms=$NOW_MS" >> $GITHUB_OUTPUT
+          echo "end_ms=$END_MS" >> $GITHUB_OUTPUT
           echo "start_ms=$START_MS" >> $GITHUB_OUTPUT
           echo "Topic: ${{ matrix.topic }}  Shard: ${{ matrix.shard }}  Day: $DAY"
-          echo "Window: $START_MS → $NOW_MS  (${WINDOW_HOURS}h)"
+          echo "Window: $START_MS → $END_MS  (${WINDOW_HOURS}h, anchored to ${DAY}T00:00:00Z)"
 
       - name: Consume + extract
         id: extract
@@ -98,7 +101,7 @@ jobs:
             --topic ${{ matrix.topic }} \
             --group "$GROUP" \
             --start-ms ${{ steps.window.outputs.start_ms }} \
-            --end-ms ${{ steps.window.outputs.now_ms }} \
+            --end-ms ${{ steps.window.outputs.end_ms }} \
             --shard-index ${{ matrix.shard }} \
             --shard-count "$SHARD_COUNT" \
             --run-seconds "$RUN_SECONDS" \
