@@ -57,9 +57,11 @@ Compression: ~10-15 GB/day total across all three topics.
 
 ## How it works
 
-`consume.yml` runs daily at 00:30 UTC (and on manual dispatch). It uses a
-**matrix strategy** with per-topic shard counts sized to historical worst-case
-duration, so all topics finish in roughly the same wall-clock budget:
+`consume.yml` runs twice daily at 00:30 and 12:30 UTC (and on manual
+dispatch). Each run consumes a 12-hour window ending at the nearest
+preceding 12h UTC boundary, so coverage stays well within the broker's
+~24h retention. It uses a **matrix strategy** with per-topic shard counts
+sized so all topics finish in roughly the same wall-clock budget:
 
 | topic                                    | format     | shards |
 |------------------------------------------|------------|-------:|
@@ -79,15 +81,15 @@ Total 20 parallel jobs (GH Free public-repo concurrent-job ceiling). The
   cert↔domain mapping stream, which we want to preserve in full for joining
   with the measurement records via `certIndex` / `fingerprint`.
 
-Each shard takes 1/N of the topic's offset range over a deterministic window
-anchored to `[DAY 00:00 UTC − 24h, DAY 00:00 UTC)`, so consecutive runs tile
-the timeline with no overlap or gap. Scripts use `assign()+seek()` and do
-NOT commit offsets — the group id (one per shard) is only a label that gives
-each shard an independent broker-side fetch quota.
+Each shard takes 1/N of the topic's offset range over a deterministic
+12-hour window ending at either `00:00` or `12:00` UTC, so consecutive
+runs tile the timeline with no overlap or gap. Scripts use `assign()+seek()`
+and do NOT commit offsets — the group id (one per shard) is only a label
+that gives each shard an independent broker-side fetch quota.
 
-Each shard's observation stream is uploaded to a per-day Release
-(`snap-YYYY-MM-DD`) as `<topic>.shard-<N>.jsonl.gz`. Re-runs overwrite via
-`--clobber`.
+Each shard's observation stream is uploaded to a per-window Release
+(`snap-YYYY-MM-DD-HH` where HH ∈ {00, 12} marks the window end) as
+`<topic>.shard-<N>.jsonl.gz`. Re-runs overwrite via `--clobber`.
 
 Topic config (shard count + format) lives in
 [`.github/shards.json`](.github/shards.json), shared between `consume.yml`
@@ -95,12 +97,15 @@ Topic config (shard count + format) lives in
 
 ### Auto-retry
 
-`retry.yml` runs daily at 04:00 UTC. It scans `snap-$(date -u +%F)` for
-expected assets and, if any are missing, re-dispatches `consume.yml` with
-a `targets` input listing just the missing `(topic, shard, shard_count, format)`
-entries plus a `day` input pinning the date (so a queued retry crossing
-midnight still targets the intended day). Manual dispatch supports a
-`dry_run` mode that only logs the missing list.
+`retry.yml` runs twice daily at 04:30 and 16:30 UTC — 4 hours after each
+main consume fire. It auto-detects the most recent 12h boundary (same
+logic as `consume.yml`), scans the matching `snap-YYYY-MM-DD-HH` Release
+for expected assets, and if any are missing, re-dispatches `consume.yml`
+with a `targets` input listing just the missing
+`(topic, shard, shard_count, format)` entries plus `day` and `hour`
+inputs pinning the window (so a queued retry crossing a boundary still
+targets the intended one). Manual dispatch supports a `dry_run` mode that
+only logs the missing list.
 
 ## Consume locally
 

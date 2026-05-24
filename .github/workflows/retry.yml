@@ -1,22 +1,26 @@
 name: retry-missing-shards
 
-# Scan today's snap-YYYY-MM-DD Release for shards listed in .github/shards.json
-# that didn't land (consume.yml job failed or got dropped), then re-dispatch
-# consume.yml targeting only the missing (topic, shard) pairs.
+# Scan the most recent consume window's snap-YYYY-MM-DD-HH Release for shards
+# listed in .github/shards.json that didn't land (consume.yml job failed or
+# got dropped), then re-dispatch consume.yml targeting only the missing
+# (topic, shard, shard_count, format) entries.
 #
-# Runs daily after the main consume window is expected to finish. Re-dispatch
-# enters consume.yml's `concurrency: consume` queue, so if the main run is
-# somehow still going, retry waits.
+# Runs twice daily, 4h after each main consume fire (00:30 + 4h = 04:30,
+# 12:30 + 4h = 16:30 UTC). Re-dispatch enters consume.yml's
+# `concurrency: consume` queue, so if the main run is somehow still going,
+# retry waits.
 
 on:
   schedule:
-    # Main consume starts 00:30 UTC and (per shard rebalance) should finish
-    # within ~2h. 04:00 UTC gives margin.
-    - cron: '0 4 * * *'
+    - cron: '30 4,16 * * *'
   workflow_dispatch:
     inputs:
       day:
         description: 'UTC date to check (YYYY-MM-DD); empty = today UTC at retry-time'
+        required: false
+        default: ''
+      hour:
+        description: 'Window-end hour to check (00 or 12, UTC); empty = nearest preceding 12h boundary from current UTC time'
         required: false
         default: ''
       dry_run:
@@ -42,12 +46,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DAY_INPUT: ${{ github.event.inputs.day }}
+          HOUR_INPUT: ${{ github.event.inputs.hour }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
 
           DAY="${DAY_INPUT:-$(date -u +%F)}"
-          TAG="snap-${DAY}"
+          if [ -n "$HOUR_INPUT" ]; then
+            HOUR="$HOUR_INPUT"
+          else
+            NOW_H=$(date -u +%H)
+            if [ "$((10#$NOW_H))" -lt 12 ]; then HOUR=00; else HOUR=12; fi
+          fi
+          if [ "$HOUR" != "00" ] && [ "$HOUR" != "12" ]; then
+            echo "hour must be 00 or 12, got $HOUR"; exit 1
+          fi
+          TAG="snap-${DAY}-${HOUR}"
           echo "Checking $TAG in $GITHUB_REPOSITORY"
 
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -98,5 +112,6 @@ jobs:
           gh workflow run consume.yml \
             -R "$GITHUB_REPOSITORY" \
             -f targets="$MISSING" \
-            -f day="$DAY"
-          echo "Dispatched consume.yml with targets ($COUNT shards) for day=$DAY"
+            -f day="$DAY" \
+            -f hour="$HOUR"
+          echo "Dispatched consume.yml with targets ($COUNT shards) for ${TAG}"

@@ -16,11 +16,14 @@ name: consume
 # input (e.g. by retry.yml) it runs only that subset, enabling per-shard
 # re-runs without re-doing finished work.
 #
-# Schedule: daily at 00:30 UTC. Manual dispatch supported with overrides.
+# Schedule: twice daily at 00:30 and 12:30 UTC. Each run consumes a 12h
+# window anchored to the nearest preceding 12h UTC boundary, so coverage
+# stays within the broker's ~24h retention with ~12h of safety margin.
+# Tag format: snap-YYYY-MM-DD-HH where HH ∈ {00, 12} marks the window end.
 
 on:
   schedule:
-    - cron: '30 0 * * *'
+    - cron: '30 0,12 * * *'
   workflow_dispatch:
     inputs:
       run_seconds:
@@ -28,9 +31,9 @@ on:
         required: false
         default: '18000'
       window_hours:
-        description: 'How many hours back from now to consume'
+        description: 'Window size in hours (default 12 matches the twice-daily schedule)'
         required: false
-        default: '24'
+        default: '12'
       max_msgs:
         description: 'Per-shard message cap (0 = unlimited)'
         required: false
@@ -44,7 +47,11 @@ on:
         required: false
         default: ''
       day:
-        description: 'Override the UTC date the run targets (YYYY-MM-DD). Empty = today UTC at job start. Use when re-driving an earlier day.'
+        description: 'Override the UTC date the run targets (YYYY-MM-DD). Empty = today UTC at job start.'
+        required: false
+        default: ''
+      hour:
+        description: 'Override the window-end hour (00 or 12, UTC). Empty = pick nearest preceding 12h boundary from current UTC time.'
         required: false
         default: ''
 
@@ -103,22 +110,36 @@ jobs:
       - name: Set window
         id: window
         env:
-          WINDOW_HOURS: ${{ github.event.inputs.window_hours || '24' }}
+          WINDOW_HOURS: ${{ github.event.inputs.window_hours || '12' }}
           DAY_INPUT: ${{ github.event.inputs.day }}
+          HOUR_INPUT: ${{ github.event.inputs.hour }}
         run: |
-          # Anchor the window to UTC midnight of the target day so consecutive
-          # runs tile [D 00:00, D+1 00:00) with no overlap or gap, regardless
-          # of cron-fire jitter. snap-DAY contains the 24h ending at DAY 00:00 UTC.
-          # `day` input overrides today's UTC date — used by retry.yml so a
-          # queued retry that crosses midnight still targets the intended day.
+          # Anchor the window end to the nearest preceding 12h UTC boundary
+          # (00:00 or 12:00) so consecutive twice-daily runs tile the timeline
+          # with no overlap or gap, independent of cron-fire jitter. Tag is
+          # snap-DAY-HH where HH marks the window end.
+          # `day` and `hour` inputs override the auto-detected values — used by
+          # retry.yml so a queued retry that crosses a boundary still targets
+          # the intended window.
           DAY="${DAY_INPUT:-$(date -u +%F)}"
-          END_MS=$(($(date -u -d "${DAY}T00:00:00Z" +%s) * 1000))
+          if [ -n "$HOUR_INPUT" ]; then
+            HOUR="$HOUR_INPUT"
+          else
+            NOW_H=$(date -u +%H)
+            if [ "$((10#$NOW_H))" -lt 12 ]; then HOUR=00; else HOUR=12; fi
+          fi
+          if [ "$HOUR" != "00" ] && [ "$HOUR" != "12" ]; then
+            echo "hour must be 00 or 12, got $HOUR"; exit 1
+          fi
+          END_MS=$(($(date -u -d "${DAY}T${HOUR}:00:00Z" +%s) * 1000))
           START_MS=$((END_MS - WINDOW_HOURS * 3600 * 1000))
           echo "day=$DAY" >> $GITHUB_OUTPUT
+          echo "hour=$HOUR" >> $GITHUB_OUTPUT
+          echo "tag=snap-${DAY}-${HOUR}" >> $GITHUB_OUTPUT
           echo "end_ms=$END_MS" >> $GITHUB_OUTPUT
           echo "start_ms=$START_MS" >> $GITHUB_OUTPUT
-          echo "Topic: ${{ matrix.topic }}  Shard: ${{ matrix.shard }}  Day: $DAY"
-          echo "Window: $START_MS → $END_MS  (${WINDOW_HOURS}h, anchored to ${DAY}T00:00:00Z)"
+          echo "Topic: ${{ matrix.topic }}  Shard: ${{ matrix.shard }}  Tag: snap-${DAY}-${HOUR}"
+          echo "Window: $START_MS → $END_MS  (${WINDOW_HOURS}h, ending at ${DAY}T${HOUR}:00:00Z)"
 
       - name: Consume + extract
         id: extract
@@ -129,8 +150,9 @@ jobs:
           SHARD_COUNT: ${{ matrix.shard_count }}
           GROUP_SUFFIX: ${{ github.event.inputs.group_suffix || '' }}
         run: |
-          mkdir -p observations/${{ steps.window.outputs.day }}
-          OBS="observations/${{ steps.window.outputs.day }}/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
+          OUTDIR="observations/${{ steps.window.outputs.day }}-${{ steps.window.outputs.hour }}"
+          mkdir -p "$OUTDIR"
+          OBS="$OUTDIR/${{ matrix.topic }}.shard-${{ matrix.shard }}.jsonl.gz"
           GROUP="gha-${{ github.event.repository.name }}-${{ matrix.topic }}-shard${{ matrix.shard }}${GROUP_SUFFIX}"
           # Dispatch to the format-appropriate consumer:
           #   avro_dns  → consume_group.py extracts dedup'd DNS observations
@@ -161,17 +183,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          DAY=${{ steps.window.outputs.day }}
-          TAG="snap-${DAY}"
+          TAG="${{ steps.window.outputs.tag }}"
+          DAY="${{ steps.window.outputs.day }}"
+          HOUR="${{ steps.window.outputs.hour }}"
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-              --title "DNS tracking ${DAY}" \
-              --notes "Per-topic per-shard observation streams extracted from OpenINTEL Zonestream measurement topics on ${DAY}."
+              --title "DNS tracking ${DAY} ${HOUR}:00 UTC" \
+              --notes "Per-topic per-shard observation streams extracted from OpenINTEL Zonestream topics — 12h window ending ${DAY}T${HOUR}:00:00Z."
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
             "${{ steps.extract.outputs.obs_path }}"
 
       - name: Job summary
         run: |
-          echo "### ${{ matrix.topic }} shard ${{ matrix.shard }} on ${{ steps.window.outputs.day }}" >> $GITHUB_STEP_SUMMARY
+          echo "### ${{ matrix.topic }} shard ${{ matrix.shard }} on ${{ steps.window.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- obs: $(numfmt --to=iec ${{ steps.extract.outputs.obs_size_bytes }})" >> $GITHUB_STEP_SUMMARY
