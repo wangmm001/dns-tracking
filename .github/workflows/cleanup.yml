@@ -53,11 +53,12 @@ jobs:
           ALL=$(gh release list -R "$GITHUB_REPOSITORY" -L 1000 \
                   --json tagName --jq '.[].tagName')
 
-          # Keep only snap-YYYY-MM-DD-HH tags whose YYYY-MM-DD < CUTOFF.
-          # YYYY-MM-DD is lexicographically date-ordered so string compare is
-          # correct.
+          # Match snap-YYYY-MM-DD-HH (current twice-daily format, HH in {00,12})
+          # AND legacy snap-YYYY-MM-DD (pre-twice-daily, no HH suffix) tags
+          # whose embedded YYYY-MM-DD < CUTOFF. YYYY-MM-DD is lexicographically
+          # date-ordered so string compare is correct.
           OLD=$(echo "$ALL" | awk -v cutoff="$CUTOFF" '
-            /^snap-[0-9]{4}-[0-9]{2}-[0-9]{2}-(00|12)$/ {
+            /^snap-[0-9]{4}-[0-9]{2}-[0-9]{2}(-(00|12))?$/ {
               if (substr($0, 6, 10) < cutoff) print $0
             }' | sort)
 
