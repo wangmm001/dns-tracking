@@ -39,6 +39,12 @@ on:
 permissions:
   contents: write
 
+# Prevent concurrent runs (scheduled cron + manual dispatch racing on the
+# same Release / consumer groups). New run waits if one is in progress.
+concurrency:
+  group: consume
+  cancel-in-progress: false
+
 jobs:
   consume:
     runs-on: ubuntu-latest
