@@ -65,25 +65,79 @@ def http_get_json(url: str):
 
 
 def http_download(url: str, dst: Path, expected_size: int, retries: int = 3) -> None:
+    """Download `url` to `dst` with HTTP Range resume on the .part tempfile.
+
+    Resume rules:
+      - If .part already equals expected_size: promote it and return (we crashed
+        between download finishing and rename).
+      - If .part is larger than expected_size: assume corrupt; drop and restart.
+      - If .part is smaller: send `Range: bytes=<size>-` and append. If the
+        server answers 200 instead of 206 (Range ignored), silently fall back
+        to a full overwrite. 416 (Range not satisfiable -- asset replaced or
+        .part stale beyond current size) also resets the .part.
+    """
     tmp = dst.with_name(dst.name + ".part")
     last_err: Exception | None = None
+
     for attempt in range(1, retries + 1):
         try:
-            req = Request(url, headers={**_auth_headers(), "Accept": "application/octet-stream"})
-            with urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f, length=1 << 20)
+            resume_from = 0
+            mode = "wb"
+            if tmp.exists():
+                cur = tmp.stat().st_size
+                if cur == expected_size:
+                    tmp.replace(dst)
+                    return
+                if cur > expected_size or cur < 0:
+                    tmp.unlink()
+                elif cur > 0:
+                    resume_from = cur
+                    mode = "ab"
+
+            headers = {**_auth_headers(), "Accept": "application/octet-stream"}
+            if resume_from > 0:
+                headers["Range"] = f"bytes={resume_from}-"
+
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=600) as r:
+                # If we asked for a range but the server returned 200, it
+                # served the whole asset -- truncate and rewrite.
+                if resume_from > 0 and r.status != 206:
+                    mode = "wb"
+                    resume_from = 0
+                if resume_from > 0:
+                    log(f"  resume from byte {resume_from:,}")
+                with open(tmp, mode) as f:
+                    shutil.copyfileobj(r, f, length=1 << 20)
+
             actual = tmp.stat().st_size
             if actual != expected_size:
                 raise IOError(f"size mismatch: got {actual}, expected {expected_size}")
             tmp.replace(dst)
             return
-        except (HTTPError, URLError, IOError, TimeoutError) as e:
+
+        except HTTPError as e:
             last_err = e
-            tmp.unlink(missing_ok=True)
+            # 416: .part offset is past the end of the current asset (the
+            # asset was replaced server-side, or .part is corrupt). Wipe and
+            # let the next attempt start fresh.
+            if e.code == 416:
+                tmp.unlink(missing_ok=True)
+            if attempt < retries:
+                backoff = 2 ** attempt
+                log(f"  retry {attempt}/{retries - 1} after {backoff}s: HTTP {e.code} {e.reason}")
+                time.sleep(backoff)
+        except (URLError, IOError, TimeoutError) as e:
+            last_err = e
+            # Keep .part on transient errors so the next attempt can resume.
+            # Only nuke it if our size check failed (data is provably wrong).
+            if isinstance(e, IOError) and "size mismatch" in str(e):
+                tmp.unlink(missing_ok=True)
             if attempt < retries:
                 backoff = 2 ** attempt
                 log(f"  retry {attempt}/{retries - 1} after {backoff}s: {e}")
                 time.sleep(backoff)
+
     assert last_err is not None
     raise last_err
 
