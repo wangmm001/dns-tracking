@@ -248,6 +248,58 @@ SELECT COUNT(*) FROM
 WHERE k='ip'"
 ```
 
+### 镜像到本地归档
+
+仓库只保留最近 30 天的 release（见上面"滚动清理"）。想长期留存、或者要
+频繁重复跑大查询，就把数据镜像到本地。`archive/download_releases.py` 把
+parquet 资产放成 Hive 分区目录树，DuckDB 不需要手写 glob 就能直接查：
+
+```
+$ARCHIVE/topic=<topic>/date=YYYY-MM-DD/hour=HH/shard-<N>.parquet
+```
+
+**无需 GitHub 登录**（走匿名 REST API）。**幂等可补漏**：每次跑都扫描全部
+`snap-YYYY-MM-DD-HH` release 和本地文件按字节数比对，**只下本地缺的**。
+所以单条 cron 就够 —— 漏跑的下次自动补上。下载走 `<file>.part` + 原子
+rename，跑到一半被杀也不会留下"看起来完整其实是半截"的文件。
+
+```bash
+export ARCHIVE=$HOME/dns-tracking-archive
+
+# 全量镜像（或后续跑作为增量补全）
+python3 archive/download_releases.py
+
+# 冷启动：把前几周历史分多次跑，摊薄带宽
+python3 archive/download_releases.py --max-releases 2
+
+# 限定 topic / 时间窗
+python3 archive/download_releases.py \
+  --topic newly_registered_domains_measurements --since 2026-05-20
+```
+
+配套的 `archive/archive.sql` 给本地归档注册好 DuckDB 视图
+（`observations` / `samples` / `inventory`），可以直接把 `topic` / `date`
+/ `hour` 当真实列来过滤：
+
+```bash
+duckdb dns.duckdb -init archive/archive.sql -c "
+  SELECT topic, date, hour, count(*) AS rows
+  FROM   observations
+  GROUP  BY 1, 2, 3
+  ORDER  BY date DESC, hour DESC, topic"
+```
+
+Crontab（每小时一次；漏跑下次自动补）：
+
+```cron
+17 * * * * ARCHIVE=$HOME/dns-tracking-archive /usr/bin/python3 \
+  /path/to/dns-tracking/archive/download_releases.py \
+  >> $HOME/dns-tracking-archive/_logs/cron.log 2>&1
+```
+
+冷启动时可设 `GH_TOKEN`（或 `GITHUB_TOKEN`），把匿名 60 req/h 限速
+提升到 5000 req/h。
+
 ## 本地消费
 
 不走 GitHub Actions 的临时消费：

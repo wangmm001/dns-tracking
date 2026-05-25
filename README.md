@@ -265,6 +265,62 @@ SELECT COUNT(*) FROM
 WHERE k='ip'"
 ```
 
+### Mirror to a local archive
+
+This repo only keeps the last 30 days of releases (see "Rolling cleanup"
+above), so anything you want long-term — or hit repeatedly with heavy
+queries — should be mirrored locally. `archive/download_releases.py` lays
+the parquet assets out as a Hive-partitioned tree that DuckDB queries
+without any per-file globs:
+
+```
+$ARCHIVE/topic=<topic>/date=YYYY-MM-DD/hour=HH/shard-<N>.parquet
+```
+
+No GitHub login required (anonymous REST API). Idempotent and gap-filling:
+every run scans every `snap-YYYY-MM-DD-HH` release, compares against local
+files by byte size, and downloads only what's missing. A single cron entry
+is enough — missed runs auto-catch-up next tick. Downloads go through
+`<file>.part` + atomic rename, so a crashed run never leaves a half-file
+that looks complete.
+
+```bash
+export ARCHIVE=$HOME/dns-tracking-archive
+
+# Full mirror (or incremental back-fill on subsequent runs)
+python3 archive/download_releases.py
+
+# Cold-start: spread the first ~weeks of history across several runs
+python3 archive/download_releases.py --max-releases 2
+
+# Restrict to one topic / time window
+python3 archive/download_releases.py \
+  --topic newly_registered_domains_measurements --since 2026-05-20
+```
+
+Companion `archive/archive.sql` registers DuckDB views (`observations`,
+`samples`, `inventory`) over the archive so you can filter on
+`topic` / `date` / `hour` as real columns:
+
+```bash
+duckdb dns.duckdb -init archive/archive.sql -c "
+  SELECT topic, date, hour, count(*) AS rows
+  FROM   observations
+  GROUP  BY 1, 2, 3
+  ORDER  BY date DESC, hour DESC, topic"
+```
+
+Crontab (hourly; missed runs are auto-caught up by the next tick):
+
+```cron
+17 * * * * ARCHIVE=$HOME/dns-tracking-archive /usr/bin/python3 \
+  /path/to/dns-tracking/archive/download_releases.py \
+  >> $HOME/dns-tracking-archive/_logs/cron.log 2>&1
+```
+
+Set `GH_TOKEN` (or `GITHUB_TOKEN`) to lift the anonymous 60 req/h API
+rate limit to 5000 req/h — handy during a fresh bootstrap.
+
 ## Consume locally
 
 For ad-hoc consumption without the GitHub Actions infrastructure:
