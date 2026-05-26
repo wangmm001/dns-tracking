@@ -76,6 +76,42 @@ snap-2026-05-25-00/
 NULL 用来区分 kind 子集 —— 例如 `k='ns'` 行 `s` 有值，`ip`/`q`/`a`/`c`/`p`
 都是 NULL。**查询时永远先按 `k` 过滤**，否则会跨 kind 误聚合。
 
+#### kind 派生规则与 NULL 分布
+
+`k` 列不是 broker 给的，是 `consume_group.py` 根据 `query_type` 和
+"qname 是否等于主域" 派生出来：
+
+| `query_type` | `qname == 主域` | 派生 `k` | 含义 |
+|---|---|---|---|
+| `A` / `AAAA` | 是 | `ip` | 主域解析到的 IP |
+| `A` / `AAAA` | 否 | `ns_ip` | 该测量返回的某个 NS 主机自己的 IP |
+| `NS` | 是 | `ns` | 主域的 NS 委派 |
+| `MX` | 是 | `mx` | 主域的 MX 记录 |
+
+去重 key 的形态因 kind 而异（每个唯一 key 在窗口内对应输出一行）：
+
+- `ip`:    `(kind, topic_tag, domain, qtype, ip, rcode)`
+- `ns_ip`: `(kind, topic_tag, ns_hostname, qtype, ip, rcode)` —— 此时 `d`
+  列为 NULL，因为这条记录挂在 NS 主机上而不是某个域名上
+- `ns`:    `(kind, topic_tag, domain, ns_hostname, rcode)`
+- `mx`:    `(kind, topic_tag, domain, mx_hostname, mx_preference, rcode)`
+
+第二次起出现相同 key 时只更新聚合字段：`fs = min(原 fs, ts)`、
+`ls = max(原 ls, ts)`、`n += 1`。所以 `n` 只反映**本 12h 窗口**的重复
+次数，不是 DarkDNS 完整 48h 测量周期的总次数。
+
+按 kind 的非 NULL 列速查：
+
+| kind | 非 NULL 列 |
+|---|---|
+| `ip` | `d, q, ip, a, c, p, tl, fs, ls, n`（+ 非零 `rc`）|
+| `ns_ip` | `s, q, ip, a, c, p, tl, fs, ls, n`（**`d` 为 NULL**）|
+| `ns` | `d, s, tl, fs, ls, n` |
+| `mx` | `d, m, pr, tl, fs, ls, n` |
+
+`a` / `c` / `p`（ASN / 国家 / 前缀）是 OpenINTEL 上游测量管线就富化好的，
+本仓库不做 GeoIP 查询，直接透传。
+
 ### Schema 2：`certstream_domains` — `consume_json.py` 输出
 
 CT log entry → 域名清单映射。一行 = 一条 CT log entry。
@@ -139,6 +175,50 @@ fetch 配额的标签**。**Broker 配额是 per-connection 而非按 consumer g
 全局共享**，所以多 shard 就是线性提速（实测可拉到单 consumer 的 ~10×）。
 
 `--clobber` 上传，partial-day 重跑不会重复。
+
+### 每天的完整时序
+
+四个 workflow 排成一条互不冲突的链：
+
+```
+00:30 UTC  consume.yml   →  snap-DAY-00（窗口：前一天 12:00 → 今天 00:00）
+04:30 UTC  retry.yml     →  扫 snap-DAY-00，缺哪个 shard 单独重发
+06:00 UTC  cleanup.yml   →  删 30 天前的 snap-* release + tag
+12:30 UTC  consume.yml   →  snap-DAY-12（窗口：今天 00:00 → 今天 12:00）
+16:30 UTC  retry.yml     →  扫 snap-DAY-12
+```
+
+cleanup 卡在两次 consume 中间执行，所以永远不会和正在写的 release 撞车。
+`consume.yml` 还配了 `concurrency: { group: consume, cancel-in-progress: false }`，
+保证排队的手动 dispatch 不会和正在跑的 cron 互相覆盖。
+
+### Shard offset 切片
+
+每个 shard 跑这套流程（见 `consume_group.compute_shard_range`）：
+
+1. 用 `offsets_for_times([start_ms, end_ms])` 把时间窗翻译成 broker offset
+   区间 `[start_off, end_off]`。end_ms 超出 retention 时回落到 high-watermark。
+2. `chunk = (end_off - start_off) // shard_count`；shard `i` 拿
+   `[start_off + i*chunk, start_off + (i+1)*chunk)`；最后一片把余数吃掉。
+3. `assign() + seek()` 到 shard 起点，poll 到 `msg.offset() >= shard_end`
+   退出。**不 commit offset** —— group id 一个 shard 一个，仅作为 broker
+   端 fetch 配额的标签。
+
+broker 限流是 **per-connection**，不是按 cluster 级 consumer group 全局
+共享。所以 shard 数线性加带宽 —— 单 consumer ~1100 msg/s 的服务端上限
+被 11 个 shard 拉到 ~10×。这就是为什么 `newly_registered_domains_measurements`
+（221M 消息/天）能在一个 5h GH job 里跑完。
+
+其它退出条件（任一触发即结束并落盘）：
+
+- `--run-seconds`（默认 18000s，留在 `runs-on: ubuntu-latest` 6h 上限内）
+- `--max-msgs`（默认 0 = 不限）
+- `--idle-exit-seconds`（默认 30s，无消息提前退）
+
+落盘走 `try / finally` —— 任何退出（包括异常）都会把内存里的 dedup dict
+一次性写成合法 Parquet（带 footer）。Parquet 的 footer 是 all-or-nothing 的，
+要么完整要么文件不存在，下游 glob 不会读到半截文件。失败的 shard 留给
+`retry.yml` 下一轮自动补。
 
 ### 为什么用 Parquet（替代 gzipped JSONL）
 

@@ -80,6 +80,43 @@ window, with `first_ts` / `last_ts` / `n` aggregates rolling up the raw
 
 NULLs distinguish kind subsets — e.g., a `k='ns'` row has `s` set but `ip`/`q`/`a`/`c`/`p` NULL. Always filter by `k` first when querying.
 
+#### kind derivation and NULL layout
+
+`k` is not a broker-supplied field — `consume_group.py` derives it from
+`query_type` and whether `qname == primary domain`:
+
+| `query_type` | `qname == domain` | derived `k` | meaning |
+|---|---|---|---|
+| `A` / `AAAA` | yes | `ip` | IP the primary domain resolves to |
+| `A` / `AAAA` | no | `ns_ip` | IP of an NS host returned by this measurement |
+| `NS` | yes | `ns` | NS delegation for the primary domain |
+| `MX` | yes | `mx` | MX record for the primary domain |
+
+Dedup-key shape depends on kind (one output row per unique key per window):
+
+- `ip`:    `(kind, topic_tag, domain, qtype, ip, rcode)`
+- `ns_ip`: `(kind, topic_tag, ns_hostname, qtype, ip, rcode)` — `d` is NULL
+  because the row hangs off an NS host, not a domain
+- `ns`:    `(kind, topic_tag, domain, ns_hostname, rcode)`
+- `mx`:    `(kind, topic_tag, domain, mx_hostname, mx_preference, rcode)`
+
+Subsequent observations of the same key only update aggregates:
+`fs = min(prev fs, ts)`, `ls = max(prev ls, ts)`, `n += 1`. So `n` reflects
+**this 12h window only**, not DarkDNS's full 48h post-detection schedule.
+
+Non-NULL columns per kind:
+
+| kind | non-NULL columns |
+|---|---|
+| `ip` | `d, q, ip, a, c, p, tl, fs, ls, n` (+ non-zero `rc`) |
+| `ns_ip` | `s, q, ip, a, c, p, tl, fs, ls, n` (**`d` is NULL**) |
+| `ns` | `d, s, tl, fs, ls, n` |
+| `mx` | `d, m, pr, tl, fs, ls, n` |
+
+`a` / `c` / `p` (ASN / country / prefix) come pre-enriched from OpenINTEL's
+upstream measurement pipeline — this repo does no GeoIP lookups, just
+passes them through.
+
 ### Schema 2: `certstream_domains` — `consume_json.py` output
 
 CT log entry → domain list mapping. One row per CT log entry.
@@ -150,6 +187,56 @@ consumer-group across the cluster, so more shards = linearly more bandwidth
 
 Re-runs overwrite assets via `--clobber`, so partial-day re-dispatches
 don't double-count.
+
+### Daily timeline
+
+The four workflows interlock into a conflict-free chain:
+
+```
+00:30 UTC  consume.yml   →  snap-DAY-00 (window: prev-day 12:00 → today 00:00)
+04:30 UTC  retry.yml     →  scan snap-DAY-00; re-dispatch missing shards
+06:00 UTC  cleanup.yml   →  delete snap-* releases + tags older than 30 days
+12:30 UTC  consume.yml   →  snap-DAY-12 (window: today 00:00 → today 12:00)
+16:30 UTC  retry.yml     →  scan snap-DAY-12
+```
+
+cleanup runs between the two consume slots, so it never collides with a
+release that's mid-write. `consume.yml` also sets
+`concurrency: { group: consume, cancel-in-progress: false }` so a manual
+dispatch can't race a running cron.
+
+### Shard offset slicing
+
+Each shard runs this loop (see `consume_group.compute_shard_range`):
+
+1. `offsets_for_times([start_ms, end_ms])` translates the time window into
+   broker offsets `[start_off, end_off]`. If `end_ms` is past retention we
+   fall back to the partition's high-watermark.
+2. `chunk = (end_off - start_off) // shard_count`; shard `i` takes
+   `[start_off + i*chunk, start_off + (i+1)*chunk)`; the last shard absorbs
+   the remainder.
+3. `assign() + seek()` to the shard's start, poll until
+   `msg.offset() >= shard_end`. **No offset commits** — the group id (one
+   per shard) is just a label for broker-side fetch-quota accounting.
+
+Broker quota is **per-connection**, not shared across a cluster-level
+consumer group, so more shards = linearly more bandwidth — the single-
+consumer ~1100 msg/s server-side cap becomes ~10× when split across 11
+shards. That's how `newly_registered_domains_measurements` (221M msgs/day)
+fits inside a 5h GH job.
+
+Other exit conditions (any triggers a clean flush):
+
+- `--run-seconds` (default 18000s, inside the `runs-on: ubuntu-latest` 6h
+  ceiling)
+- `--max-msgs` (default 0 = unlimited)
+- `--idle-exit-seconds` (default 30s with no messages)
+
+The flush is wrapped in `try / finally`, so any exit path (including
+exceptions) writes the in-memory dedup dict as a complete Parquet file
+with a valid footer. Parquet's footer is all-or-nothing, so downstream
+globs never see a half-written file. Shards that fail mid-window get
+picked up by `retry.yml` on the next tick.
 
 ### Why Parquet (and not gzipped JSONL)
 
