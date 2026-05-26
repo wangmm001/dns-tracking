@@ -291,6 +291,86 @@ WHERE ip.a = '13335'    -- Cloudflare
 LIMIT 50"
 ```
 
+### NS 维度分析
+
+NS 委派靠两类行：`k='ns'`（域名 `d` → NS 主机名 `s`）和 `k='ns_ip'`
+（NS 主机名 `s` → IP / AS / 国家）。下面的例子都打在
+`newly_registered_domains_measurements`（新注册主域）上。
+
+```sql
+-- 1) 列出委派给指定 NS 主机的所有新域名
+duckdb -c "
+SELECT d AS domain, fs, ls, n
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+WHERE k='ns' AND s='dns1.namecheaphosting.com'
+ORDER BY fs"
+
+-- 2) NS 集中度排行（哪些 NS 集群当天接到最多新域名）
+--    NS 通常成对部署（ns1/ns2/…），后缀匹配比精确匹配更稳
+duckdb -c "
+SELECT s AS ns_host,
+       COUNT(DISTINCT d) AS new_domains,
+       SUM(n)            AS total_measurements,
+       MIN(fs) AS first_ms, MAX(ls) AS last_ms
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+WHERE k='ns' AND ends_with(s, '.cloudflare.com')
+GROUP BY s ORDER BY new_domains DESC"
+
+-- 3) 按 NS 的 ASN 反查 —— 先用 k='ns_ip' 收 NS hostname 集合，再回查 k='ns'
+duckdb -c "
+WITH ns_hosts AS (
+  SELECT DISTINCT s AS ns_host
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns_ip' AND a='13335'   -- Cloudflare ASN
+)
+SELECT ns.d AS domain, ns.s AS ns_host, ns.fs, ns.ls, ns.n
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet' AS ns
+JOIN ns_hosts ON ns.s = ns_hosts.ns_host
+WHERE ns.k='ns'
+ORDER BY ns.fs"
+
+-- 4) NS → 域名 → 托管 AS：某 NS 上的域名都托管在哪些 AS
+--    NS 单一但托管 AS 高度集中（甚至与 NS 同 AS）→ 滥用 hosting + 自营 NS 组合
+duckdb -c "
+WITH ns_doms AS (
+  SELECT DISTINCT d
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' AND s='ns1.suspicious-registrar.com'
+)
+SELECT ip.a AS asn, ip.c AS country,
+       COUNT(DISTINCT ip.d)  AS domain_cnt,
+       COUNT(DISTINCT ip.ip) AS distinct_ips
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet' AS ip
+JOIN ns_doms USING (d)
+WHERE ip.k='ip'
+GROUP BY ip.a, ip.c ORDER BY domain_cnt DESC"
+
+-- 5) 换 NS 检测：跨两个窗口比较 NS 集合（域名通常 2+ NS，要按集合比，不能用 MIN/MAX）
+duckdb -c "
+WITH y AS (
+  SELECT d, list_sort(array_agg(DISTINCT s)) AS ns_set
+  FROM 'snap-2026-05-24-12/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' GROUP BY d
+), t AS (
+  SELECT d, list_sort(array_agg(DISTINCT s)) AS ns_set
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' GROUP BY d
+)
+SELECT y.d, y.ns_set AS prev_ns, t.ns_set AS now_ns
+FROM y JOIN t USING (d)
+WHERE y.ns_set != t.ns_set
+LIMIT 50"
+```
+
+注意：
+
+- 三个 Avro topic 都会出 `k='ns'` 行；只看新注册主域时用
+  `newly_registered_domains_measurements` 文件名锁定（或加 `topic='domains'`
+  过滤）。想包含 CT log 触发的域名再 union `certs`。
+- 短时间内同一 NS 突然涌入大量新域名（`last_ms - first_ms` 很小、
+  `new_domains` 突增）—— 典型的批量注册 / DGA / 滥用注册商信号。
+- ccTLD 主域基本拿不到，详见 "注意事项"。
+
 ### 跨日查询 / 纵向跟踪
 
 ```sql

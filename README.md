@@ -314,6 +314,91 @@ WHERE ip.a = '13335'    -- Cloudflare
 LIMIT 50"
 ```
 
+### NS-centric analysis
+
+NS delegation lives in two row kinds: `k='ns'` (domain `d` → NS hostname
+`s`) and `k='ns_ip'` (NS hostname `s` → IP / AS / country). The examples
+below all run against `newly_registered_domains_measurements`.
+
+```sql
+-- 1) Domains delegated to a specific NS hostname
+duckdb -c "
+SELECT d AS domain, fs, ls, n
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+WHERE k='ns' AND s='dns1.namecheaphosting.com'
+ORDER BY fs"
+
+-- 2) NS-cluster concentration (which NS clusters take in the most new domains)
+--    NS hosts are usually paired (ns1/ns2/…); suffix match is more robust than equality.
+duckdb -c "
+SELECT s AS ns_host,
+       COUNT(DISTINCT d) AS new_domains,
+       SUM(n)            AS total_measurements,
+       MIN(fs) AS first_ms, MAX(ls) AS last_ms
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+WHERE k='ns' AND ends_with(s, '.cloudflare.com')
+GROUP BY s ORDER BY new_domains DESC"
+
+-- 3) Reverse lookup by NS ASN — first gather NS hostnames via k='ns_ip',
+--    then resolve them back through k='ns'
+duckdb -c "
+WITH ns_hosts AS (
+  SELECT DISTINCT s AS ns_host
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns_ip' AND a='13335'   -- Cloudflare ASN
+)
+SELECT ns.d AS domain, ns.s AS ns_host, ns.fs, ns.ls, ns.n
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet' AS ns
+JOIN ns_hosts ON ns.s = ns_hosts.ns_host
+WHERE ns.k='ns'
+ORDER BY ns.fs"
+
+-- 4) NS → domains → hosting AS: which ASes host the domains served by a given NS.
+--    Single NS but heavy AS concentration (especially same AS as the NS) →
+--    classic abusive-hosting + bring-your-own-NS pattern.
+duckdb -c "
+WITH ns_doms AS (
+  SELECT DISTINCT d
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' AND s='ns1.suspicious-registrar.com'
+)
+SELECT ip.a AS asn, ip.c AS country,
+       COUNT(DISTINCT ip.d)  AS domain_cnt,
+       COUNT(DISTINCT ip.ip) AS distinct_ips
+FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet' AS ip
+JOIN ns_doms USING (d)
+WHERE ip.k='ip'
+GROUP BY ip.a, ip.c ORDER BY domain_cnt DESC"
+
+-- 5) NS-change detection: compare NS *sets* across two windows
+--    (domains usually have 2+ NS — set comparison, not MIN/MAX)
+duckdb -c "
+WITH y AS (
+  SELECT d, list_sort(array_agg(DISTINCT s)) AS ns_set
+  FROM 'snap-2026-05-24-12/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' GROUP BY d
+), t AS (
+  SELECT d, list_sort(array_agg(DISTINCT s)) AS ns_set
+  FROM 'snap-2026-05-25-00/newly_registered_domains_measurements.shard-*.parquet'
+  WHERE k='ns' GROUP BY d
+)
+SELECT y.d, y.ns_set AS prev_ns, t.ns_set AS now_ns
+FROM y JOIN t USING (d)
+WHERE y.ns_set != t.ns_set
+LIMIT 50"
+```
+
+Notes:
+
+- All three Avro topics emit `k='ns'` rows; pin the filename to
+  `newly_registered_domains_measurements` (or filter `topic='domains'`)
+  to look at newly-registered apex domains only. Union in `certs` to
+  also pick up CT-triggered domains.
+- A sudden burst of new domains on the same NS (small `last_ms - first_ms`,
+  large `new_domains`) is a strong bulk-registration / DGA / abusive-registrar
+  signal.
+- ccTLD apex domains are essentially absent — see "Notes".
+
 ### Cross-day / longitudinal queries
 
 ```sql
