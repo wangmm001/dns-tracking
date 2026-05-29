@@ -57,18 +57,28 @@ Categories:
 | `bodis` | `.bodis.com` | Bodis | 8 | A |
 | `cashparking` | `.cashparking.com` | GoDaddy CashParking | 69 | A |
 | `internettraffic` | `.internettraffic.com` | Internet Traffic | 4 | A |
-| `share_dns` | `.share-dns.net`, `.share-dns.com` | Share-DNS (CN) | 31,226 | B |
-| `spixiv` | `.spixiv.com` | Spixiv (CN) | 29,003 | B |
-| `julydns` | `.julydns.com` | JulyDNS (CN) | 10,959 | B |
-| `xundns` | `.xundns.com` | XunDNS (CN) | 7,571 | B |
-| `taoa` | `.taoa.com` | Taoa (CN) | 5,160 | B |
-| `mismes` | `.mismes.com` | Mismes (CN) | 4,803 | B |
-| `jindun9` | `.jindun9.com` | Jindun9 (CN) | 3,140 | B |
-| `onclouddns` | `.onclouddns.com` | OnCloudDNS (CN) | 2,984 | B |
-| `dnsowl` | `.dnsowl.com` | Unknown (Sedo AS-adjacent) | 7,044 | W |
+| `taoa` | `.taoa.com` | Eranet / 淘阿网 (CN registrar) | 5,160 | C |
+| `xundns` | `.xundns.com` | DNS.LA / 帝恩爱斯 | 7,571 | C |
+| `julydns` | `.julydns.com` | Unknown CN DNS hosting (homepage shows DNS control panel) | 10,959 | C |
+| `mismes` | `.mismes.com` | Xin Net / 新网 (CN registrar; NS via xincache.com) | 4,803 | C |
+| `share_dns` | `.share-dns.net`, `.share-dns.com` | Unknown — no public site, Gname+CF backend | 31,226 | W |
+| `spixiv` | `.spixiv.com` | Unknown — DGA-shaped subdomains (e.g. `10ajh.top`) | 29,003 | W |
+| `jindun9` | `.jindun9.com` | Unknown — NS only 5 months old, .sbs phish samples | 3,140 | W |
+| `onclouddns` | `.onclouddns.com` | Unknown — NS only 1 month old, handles 3k/day | 2,984 | W |
+| `dnsowl` | `.dnsowl.com` | Unknown — Sedo AS-adjacent | 7,044 | W |
 
 Removed from earlier draft (zero traffic in 2026-05-28 window):
 `voodoo.com`, `smartname.com`.
+
+**CN provider reclassification (2026-05-29):** initial seed lumped 8 CN
+NS apexes into Tier B based on parking-shape pattern matching. WHOIS +
+homepage verification reclassified them: 4 are confirmed CN registrar /
+DNS hosting services (taoa = 淘阿网 registrar, xundns = DNS.LA service,
+julydns = DNS control panel, mismes = Xin Net 新网 registrar — all
+Tier C, kept active for volume tracking but downstream MUST treat as
+non-PPC); 4 are opaque (no public site, recent NS, suspicious samples)
+and moved to Watchlist (`share_dns`, `spixiv`, `jindun9`, `onclouddns`).
+v1 active count drops from 19 → 15.
 
 **Attribution correction (2026-05-29):** an earlier draft mis-attributed
 `.dns-parking.com` and `.dyna-ns.net` to Team Internet based on a shared
