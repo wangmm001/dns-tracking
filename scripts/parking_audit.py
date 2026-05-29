@@ -11,12 +11,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import os
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -102,12 +99,13 @@ def configured_apexes(providers) -> set[str]:
 
 
 def render_report(topk_path: Path, providers, window_days: int,
-                  tags: list[str], threshold: int = 1000) -> str:
+                  tags: list[str], threshold: int = 1000) -> tuple[str, int]:
     csv_path = topk_path.with_suffix(".csv")
-    subprocess.run(
-        ["duckdb", "-csv", "-c",
-         f"SELECT * FROM '{topk_path}'"], stdout=open(csv_path, "w"), check=True,
-    )
+    with open(csv_path, "w") as fh:
+        subprocess.run(
+            ["duckdb", "-csv", "-c", f"SELECT * FROM '{topk_path}'"],
+            stdout=fh, check=True,
+        )
     configured = configured_apexes(providers)
     unhandled, handled = [], []
     with open(csv_path) as f:
@@ -148,7 +146,7 @@ def render_report(topk_path: Path, providers, window_days: int,
         lines.append(
             f"| `{r['ns_apex']}` | {r['new_domains']} | {r['distinct_ns_hosts']} |"
         )
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", len(unhandled)
 
 
 def main(argv=None) -> int:
@@ -170,7 +168,7 @@ def main(argv=None) -> int:
     subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
 
     providers = load_providers(args.config)
-    report = render_report(topk_path, providers, args.window_days, tags)
+    report, unhandled_count = render_report(topk_path, providers, args.window_days, tags)
     report_path = workdir / "report.md"
     report_path.write_text(report)
     print(f"wrote {topk_path} and {report_path}", file=sys.stderr)
@@ -186,7 +184,7 @@ def main(argv=None) -> int:
     print(f"uploaded audit to {audit_tag}", file=sys.stderr)
 
     # Open or update issue.
-    title = f"Parking audit {month}: {sum(1 for ln in report.splitlines() if ln.startswith('| `'))} candidates"
+    title = f"Parking audit {month}: {unhandled_count} candidate{'s' if unhandled_count != 1 else ''}"
     body  = report
     subprocess.run(
         ["gh", "issue", "create", "-R", args.repo,
