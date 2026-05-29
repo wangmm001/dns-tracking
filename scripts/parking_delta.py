@@ -73,6 +73,44 @@ GROUP BY provider, d;
 """
 
 
+def build_ct_signal_sql(snap_tag: str, shards_config: str, repo: str) -> str:
+    """Add ct_sources and ct_fingerprints to today_new via apex-level
+    LEFT JOIN with certstream_domains in the same snap.
+
+    apex_of() heuristic in SQL: take last 2 dot-labels of the lowercased
+    domain (matches .com/.net/.io etc; misses .co.uk-style ccTLD2LDs, which
+    are absent from upstream data anyway).
+    """
+    ct_urls = shard_urls(snap_tag, shards_config, repo)["certstream_domains"]
+    url_list_sql = ",\n    ".join(f"'{u}'" for u in ct_urls)
+    return f"""
+CREATE OR REPLACE TEMP TABLE ct_unnest AS
+WITH cs AS (
+  SELECT source, fingerprint, lower(rtrim(unnest(domain_list), '.')) AS raw_d
+  FROM read_parquet([
+    {url_list_sql}
+  ])
+  WHERE domain_list IS NOT NULL
+)
+SELECT
+  array_to_string(list_slice(string_split(raw_d, '.'), -2, -1), '.') AS apex,
+  source, fingerprint
+FROM cs
+WHERE raw_d <> '';
+
+CREATE OR REPLACE TEMP TABLE today_new_ct AS
+SELECT
+  t.provider, t.domain, t.ns_set, t.source_topics,
+  t.first_ms, t.last_ms, t.observations,
+  list_sort(array_agg(DISTINCT c.source)      FILTER (WHERE c.source      IS NOT NULL)) AS ct_sources,
+  list_sort(array_agg(DISTINCT c.fingerprint) FILTER (WHERE c.fingerprint IS NOT NULL)) AS ct_fingerprints
+FROM today_new t
+LEFT JOIN ct_unnest c ON c.apex = t.domain
+GROUP BY t.provider, t.domain, t.ns_set, t.source_topics,
+         t.first_ms, t.last_ms, t.observations;
+"""
+
+
 def download_seen_years(state_release: str, repo: str, dest: Path,
                         dry_run: bool) -> list[Path]:
     """Download all seen-YYYY.parquet assets from the state release.
@@ -185,17 +223,22 @@ def main(argv: list[str] | None = None) -> int:
           file=sys.stderr)
 
     anti_join_sql = build_anti_join_sql(seen_paths)
-    # Update sql_file: prepend after today_ns, before counts.
-    counts_sql = (
-        "SELECT provider, COUNT(*) AS new_today "
-        "FROM today_new GROUP BY provider ORDER BY new_today DESC;"
-    )
+    ct_sql = build_ct_signal_sql(args.snap_tag, args.shards_config, args.repo)
+    counts_sql = """
+SELECT provider,
+       COUNT(*) AS new_today,
+       COUNT(*) FILTER (WHERE len(ct_sources) > 0) AS with_ct_signal
+FROM today_new_ct
+GROUP BY provider
+ORDER BY new_today DESC;
+"""
     sql_file.write_text(
         "INSTALL httpfs; LOAD httpfs;\n"
         "SET memory_limit='6GB';\n"
         "SET enable_progress_bar=false;\n"
         f"{today_ns_sql}\n"
         f"{anti_join_sql}\n"
+        f"{ct_sql}\n"
         f"{counts_sql}\n"
     )
     print(f"wrote SQL to {sql_file}", file=sys.stderr)
