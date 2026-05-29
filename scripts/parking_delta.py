@@ -302,6 +302,18 @@ COPY (
         print(f"DRY RUN: outputs in {workdir}", file=sys.stderr)
         return 0
 
+    from scripts.parking_common import gh_upload_assets
+    delta_tag = f"{args.delta_release_prefix}{args.snap_tag.removeprefix('snap-')}"
+    delta_files = sorted(str(p) for p in workdir.glob("delta.*.parquet"))
+    delta_files += sorted(str(p) for p in workdir.glob("delta.*.jsonl"))
+    delta_files.append(str(manifest))
+    gh_upload_assets(
+        delta_tag, delta_files, args.repo,
+        title=f"Parking delta {args.snap_tag.removeprefix('snap-')}",
+    )
+    print(f"uploaded {len(delta_files)} assets to {delta_tag}",
+          file=sys.stderr)
+
 
 if __name__ == "__main__":
     sys.exit(main())
