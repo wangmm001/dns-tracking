@@ -1,0 +1,63 @@
+name: parking-audit
+
+# Monthly NS-concentration audit. Re-runs the data-driven top-K NS query
+# against the last 30 days of snap-* releases and surfaces high-volume
+# ns_apex values not in parking_providers.json. Uploads report + raw
+# top-K to parking-audit-YYYY-MM and opens a GitHub Issue for triage.
+
+on:
+  schedule:
+    - cron: '0 7 1 * *'   # 07:00 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      window_days:
+        description: 'Audit window in days (default 30)'
+        required: false
+        default: '30'
+      dry_run:
+        description: 'If "true", skip upload + issue creation'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: parking-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup duckdb + python deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+          curl -sS -L https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          unzip -q -o /tmp/duckdb.zip -d /usr/local/bin
+          python3 -m pip install --quiet pyarrow
+
+      - name: Run parking_audit.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOW_DAYS: ${{ github.event.inputs.window_days || '30' }}
+          DRY_RUN:     ${{ github.event.inputs.dry_run     || 'false' }}
+        run: |
+          set -euo pipefail
+          ARGS=("--window-days" "$WINDOW_DAYS"
+                "--workdir" "$RUNNER_TEMP/parking-audit")
+          [ "$DRY_RUN" = "true" ] && ARGS+=("--dry-run")
+          python3 -m scripts.parking_audit "${ARGS[@]}"
+
+      - name: Upload artifact on dry-run
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parking-audit
+          path: ${{ runner.temp }}/parking-audit/
+          retention-days: 30
