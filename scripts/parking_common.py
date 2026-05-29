@@ -10,7 +10,7 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 SNAP_TAG_RE = re.compile(r"^snap-(\d{4}-\d{2}-\d{2})-(00|12)$")
 REPO_DEFAULT = "wangmm001/dns-tracking"
