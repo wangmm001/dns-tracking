@@ -73,6 +73,40 @@ GROUP BY provider, d;
 """
 
 
+def download_seen_years(state_release: str, repo: str, dest: Path,
+                        dry_run: bool) -> list[Path]:
+    """Download all seen-YYYY.parquet assets from the state release.
+    Returns local paths (possibly empty). Bootstrap empty if release missing."""
+    if dry_run:
+        return []
+    from scripts.parking_common import gh_release_assets, gh_download_asset
+    have = gh_release_assets(state_release, repo)
+    matching = sorted(n for n in have if n.startswith("seen-") and n.endswith(".parquet"))
+    out: list[Path] = []
+    for name in matching:
+        path = Path(gh_download_asset(state_release, name, str(dest), repo))
+        out.append(path)
+    return out
+
+
+def build_anti_join_sql(seen_paths: list[Path]) -> str:
+    """Replace today_ns with a copy excluding (provider, domain) pairs already in seen."""
+    if not seen_paths:
+        return (
+            "CREATE OR REPLACE TEMP TABLE today_new AS "
+            "SELECT * FROM today_ns;"
+        )
+    seen_list = ", ".join(f"'{p}'" for p in seen_paths)
+    return f"""
+CREATE OR REPLACE TEMP TABLE seen AS
+SELECT provider, domain FROM read_parquet([{seen_list}], union_by_name=true);
+
+CREATE OR REPLACE TEMP TABLE today_new AS
+SELECT t.* FROM today_ns t
+ANTI JOIN seen USING (provider, domain);
+"""
+
+
 def verify_snap_complete(snap_tag: str, shards_config: str, repo: str,
                          retry_after_s: int = 300,
                          max_retries: int = 1) -> None:
@@ -142,21 +176,31 @@ def main(argv: list[str] | None = None) -> int:
     today_ns_sql = build_today_ns_sql(
         args.snap_tag, args.shards_config, args.repo, active,
     )
+
+    seen_dir = workdir / "seen"
+    seen_dir.mkdir(exist_ok=True)
+    seen_paths = download_seen_years(args.state_release, args.repo,
+                                     seen_dir, args.dry_run)
+    print(f"loaded {len(seen_paths)} seen-YYYY.parquet year(s)",
+          file=sys.stderr)
+
+    anti_join_sql = build_anti_join_sql(seen_paths)
+    # Update sql_file: prepend after today_ns, before counts.
     counts_sql = (
         "SELECT provider, COUNT(*) AS new_today "
-        "FROM today_ns GROUP BY provider ORDER BY new_today DESC;"
+        "FROM today_new GROUP BY provider ORDER BY new_today DESC;"
     )
     sql_file.write_text(
         "INSTALL httpfs; LOAD httpfs;\n"
         "SET memory_limit='6GB';\n"
         "SET enable_progress_bar=false;\n"
         f"{today_ns_sql}\n"
+        f"{anti_join_sql}\n"
         f"{counts_sql}\n"
     )
     print(f"wrote SQL to {sql_file}", file=sys.stderr)
 
     if args.dry_run:
-        # Quick correctness check: execute and print counts.
         import subprocess
         subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
         return 0
