@@ -39,13 +39,16 @@ Categories:
 - **A** Well-known PPC parking operators (high confidence).
 - **B** High-concentration NS clusters with parking-shaped samples but
   less-known operators (medium confidence; promoted on sample inspection).
+- **C** Confirmed NOT PPC (registrar default / managed DNS), kept in
+  scope for volume tracking but downstream MUST NOT aggregate with PPC
+  tiers. Re-evaluate in v2 — likely candidates for `active: false`.
 - **W** Watchlist (`active: false`): suspected non-PPC or unverified.
 
 | name (config) | ns_suffix | org | 24h | tier |
 |---|---|---|---:|---|
-| `team_internet_dns_parking` | `.dns-parking.com` | Team Internet | 38,888 | A |
-| `team_internet_dyna_ns` | `.dyna-ns.net` | Team Internet (inferred — shares AS206834 with parkingcrew.net) | 44,068 | B |
-| `team_internet_parkingcrew` | `.parkingcrew.net` | Team Internet | 203 | A |
+| `hostinger_dns_parking` | `.dns-parking.com` | Hostinger — registrar default DNS, NOT PPC parking | 38,888 | C |
+| `dynadot_dyna_ns` | `.dyna-ns.net` | Dynadot — registrar managed DNS, NOT parking | 44,068 | C |
+| `parkingcrew` | `.parkingcrew.net` | Team Internet AG — PPC parking | 203 | A |
 | `above_domains` | `.abovedomains.com` | Above.com (Trellian) — AS133618 | 13,990 | A |
 | `above_legacy` | `.above.com` | Above.com (Trellian, legacy NS — migrated to abovedomains.com) | 4 | A |
 | `above_redirect` | `.dns-redirect.com` | Above.com (Trellian, inferred — redirector pattern) | 8,197 | B |
@@ -67,11 +70,22 @@ Categories:
 Removed from earlier draft (zero traffic in 2026-05-28 window):
 `voodoo.com`, `smartname.com`.
 
+**Attribution correction (2026-05-29):** an earlier draft mis-attributed
+`.dns-parking.com` and `.dyna-ns.net` to Team Internet based on a shared
+ASN observation (AS206834). Authoritative WHOIS / official docs confirm:
+`.dns-parking.com` is Hostinger's NS pool (default DNS for unconfigured
+customer domains), and `.dyna-ns.net` is Dynadot's managed DNS for active
+customers. Only `.parkingcrew.net` is Team Internet's PPC parking. Volume
+on dns-parking / dyna-ns is huge precisely because most newly-registered
+domains haven't been pointed anywhere yet and inherit the registrar
+default — this is NOT PPC parking but an undeveloped-domain proxy signal.
+Kept in v1 (tier C) to validate the pipeline; v2 should decide whether to
+retain as a separate "registrar default DNS" category or drop entirely.
+
 Rule for splitting vs combining `ns_suffix` entries:
 
 - **Split** when the apexes are *alternatives over time* (one operator
-  migrated from A → B; some legacy domains still on A). Examples here:
-  Team Internet (`parkingcrew.net` + `dns-parking.com` + `dyna-ns.net`),
+  migrated from A → B; some legacy domains still on A). Example here:
   Above.com (`above.com` + `abovedomains.com`). Splitting makes the
   migration itself observable (a domain re-emitted under the new entry
   is a signal); combined would silently fold migrated domains back into
