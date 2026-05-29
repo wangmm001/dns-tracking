@@ -108,6 +108,37 @@ def write_manifest(workdir: Path, snap_tag: str, runtime_s: float,
     return manifest
 
 
+def build_seen_write_sql(year: str, snap_tag: str,
+                        existing_seen: Path | None,
+                        out_path: Path) -> str:
+    """Merge today_new_ct into existing seen-YYYY.parquet (if any) and write
+    the merged result to out_path."""
+    base = (
+        f"SELECT provider, domain, '{snap_tag}' AS first_snap, first_ms "
+        f"FROM today_new_ct"
+    )
+    if existing_seen is not None:
+        union = (
+            f"SELECT provider, domain, first_snap, first_ms "
+            f"FROM read_parquet('{existing_seen}')"
+        )
+        merged = f"({base})\nUNION ALL\n({union})"
+    else:
+        merged = f"({base})"
+    return f"""
+CREATE OR REPLACE TEMP TABLE merged AS
+SELECT provider, domain,
+       arg_min(first_snap, first_ms) AS first_snap,
+       MIN(first_ms)                 AS first_ms
+FROM (
+{merged}
+) GROUP BY provider, domain;
+
+COPY (SELECT * FROM merged ORDER BY provider, domain)
+TO '{out_path}' (FORMAT 'parquet', COMPRESSION 'zstd');
+"""
+
+
 def build_ct_signal_sql(snap_tag: str, shards_config: str, repo: str) -> str:
     """Add ct_sources and ct_fingerprints to today_new via apex-level
     LEFT JOIN with certstream_domains in the same snap.
@@ -313,6 +344,31 @@ COPY (
     )
     print(f"uploaded {len(delta_files)} assets to {delta_tag}",
           file=sys.stderr)
+
+    # Append to seen-YYYY for the current year (snap date).
+    year = date[:4]
+    existing = workdir / "seen" / f"seen-{year}.parquet"
+    existing = existing if existing.exists() else None
+    out_seen = workdir / f"seen-{year}.parquet.new"
+    seen_sql = build_seen_write_sql(year, args.snap_tag, existing, out_seen)
+    seen_sql_file = workdir / "seen.sql"
+    seen_sql_file.write_text(
+        "INSTALL httpfs; LOAD httpfs;\n"
+        "SET memory_limit='6GB';\n"
+        # today_new_ct must be regenerated in this fresh duckdb invocation
+        # since the previous one exited; for now, re-run the full SQL chain.
+        + sql_file.read_text() + seen_sql
+    )
+    subprocess.run(["duckdb", "-f", str(seen_sql_file)], check=True)
+
+    # Atomic upload: rename .new → seen-YYYY.parquet and upload with --clobber.
+    final = workdir / f"seen-{year}.parquet"
+    out_seen.replace(final)
+    gh_upload_assets(args.state_release, [str(final)], args.repo,
+                     title="Parking-NS seen state")
+    print(f"uploaded seen-{year}.parquet to {args.state_release}",
+          file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
