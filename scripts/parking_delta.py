@@ -352,14 +352,24 @@ COPY (
 
     from scripts.parking_common import gh_upload_assets
     delta_tag = f"{args.delta_release_prefix}{args.snap_tag.removeprefix('snap-')}"
-    delta_files = sorted(str(p) for p in workdir.glob("delta.*.parquet"))
-    delta_files += sorted(str(p) for p in workdir.glob("delta.*.jsonl"))
+    # Skip 0-byte files: empty .jsonl (provider had no new domains this snap)
+    # is 0 bytes, and gh release upload rejects 0-byte assets with HTTP 400
+    # "Bad Content-Length". Empty parquets carry a valid footer (~1-2 KB) and
+    # always upload, preserving the "every provider gets a parquet" guarantee
+    # from spec §5.2.
+    delta_files: list[str] = []
+    skipped = 0
+    for p in sorted(workdir.glob("delta.*.parquet")) + sorted(workdir.glob("delta.*.jsonl")):
+        if p.stat().st_size == 0:
+            skipped += 1
+            continue
+        delta_files.append(str(p))
     delta_files.append(str(manifest))
     gh_upload_assets(
         delta_tag, delta_files, args.repo,
         title=f"Parking delta {args.snap_tag.removeprefix('snap-')}",
     )
-    print(f"uploaded {len(delta_files)} assets to {delta_tag}",
+    print(f"uploaded {len(delta_files)} assets ({skipped} skipped, 0-byte) to {delta_tag}",
           file=sys.stderr)
 
     # Append to seen-YYYY for the current year (snap date).
