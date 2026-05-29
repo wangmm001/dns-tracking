@@ -71,24 +71,39 @@ def submit_one(domain: str, access_key: str, secret_key: str,
                timeout_s: float = 30.0) -> dict:
     """Submit one domain. Returns a dict suitable for jsonl output.
 
-    status ∈ {"queued", "error"}. On queued, includes SPN job_id so the
-    capture can be polled later. On error, includes a short error tag.
+    status ∈ {"queued", "no_job_id", "error"}. Records SPN's actual
+    response fields (job_id / url / message) when present so a missing
+    job_id can be debugged later without re-querying SPN.
     """
-    req = build_target_url(domain)  # for the result record
-    record = {"domain": domain, "url": req}
+    target_url = build_target_url(domain)
+    record = {"domain": domain, "url": target_url}
     try:
         spn_req = build_spn_request(domain, access_key, secret_key)
         with urllib.request.urlopen(spn_req, timeout=timeout_s) as resp:
-            payload = json.load(resp)
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                record.update({
+                    "status": "error",
+                    "error":  "non_json_response",
+                    "http":   resp.status,
+                    "body":   raw[:300],
+                })
+                return record
+            job_id = payload.get("job_id")
             record.update({
-                "status":   "queued",
-                "job_id":   payload.get("job_id"),
-                "http":     resp.status,
+                "http":           resp.status,
+                "job_id":         job_id,
+                "spn_url":        payload.get("url"),
+                "spn_message":    payload.get("message"),
+                "spn_status_ext": payload.get("status_ext"),
             })
+            record["status"] = "queued" if job_id else "no_job_id"
             return record
     except urllib.error.HTTPError as e:
         try:
-            err_body = e.read().decode("utf-8", errors="replace")[:200]
+            err_body = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             err_body = ""
         record.update({
@@ -98,8 +113,22 @@ def submit_one(domain: str, access_key: str, secret_key: str,
             "body":   err_body,
         })
         return record
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        record.update({"status": "error", "error": f"network:{type(e).__name__}"})
+    except urllib.error.URLError as e:
+        # URLError wraps the underlying transport failure in .reason.
+        # Surface that so URLError isn't an opaque label.
+        reason = getattr(e, "reason", e)
+        record.update({
+            "status": "error",
+            "error":  f"urlerror:{type(reason).__name__}",
+            "reason": str(reason)[:200],
+        })
+        return record
+    except (TimeoutError, OSError) as e:
+        record.update({
+            "status": "error",
+            "error":  f"network:{type(e).__name__}",
+            "reason": str(e)[:200],
+        })
         return record
 
 
@@ -170,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     results_file = workdir / f"archive.{args.provider}.jsonl"
-    counts = {"queued": 0, "error": 0}
+    counts = {"queued": 0, "no_job_id": 0, "error": 0}
     rate_429 = 0
 
     t0 = time.monotonic()
@@ -190,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
 
             if (i + 1) % 25 == 0 or (i + 1) == len(domains):
                 print(f"  [{i+1}/{len(domains)}] queued={counts.get('queued',0)} "
+                      f"no_job_id={counts.get('no_job_id',0)} "
                       f"error={counts.get('error',0)} 429={rate_429}",
                       file=sys.stderr)
 
@@ -200,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         "provider":        args.provider,
         "submitted":       len(domains),
         "queued":          counts.get("queued", 0),
+        "no_job_id":       counts.get("no_job_id", 0),
         "error":           counts.get("error", 0),
         "rate_429_hits":   rate_429,
         "runtime_s":       round(runtime, 1),
