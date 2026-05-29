@@ -57,9 +57,15 @@ jobs:
           # AND legacy snap-YYYY-MM-DD (pre-twice-daily, no HH suffix) tags
           # whose embedded YYYY-MM-DD < CUTOFF. YYYY-MM-DD is lexicographically
           # date-ordered so string compare is correct.
+          # Match snap-YYYY-MM-DD-HH, legacy snap-YYYY-MM-DD, and
+          # parking-DAY-YYYY-MM-DD-HH; parking-state and parking-audit-*
+          # stay (permanent / kept for trend analysis).
           OLD=$(echo "$ALL" | awk -v cutoff="$CUTOFF" '
             /^snap-[0-9]{4}-[0-9]{2}-[0-9]{2}(-(00|12))?$/ {
-              if (substr($0, 6, 10) < cutoff) print $0
+              if (substr($0, 6, 10) < cutoff) print $0; next
+            }
+            /^parking-DAY-[0-9]{4}-[0-9]{2}-[0-9]{2}-(00|12)$/ {
+              if (substr($0, 13, 10) < cutoff) print $0
             }' | sort)
 
           COUNT=$(echo -n "$OLD" | grep -c . || true)
