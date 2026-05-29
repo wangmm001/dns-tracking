@@ -1,0 +1,103 @@
+name: parking-archive
+
+# Submit newly-registered parkingcrew apex domains to Internet Archive's
+# Save Page Now (SPN) v2 API after each parking_daily run completes.
+#
+# Filters delta.parkingcrew.parquet to rows where source_topics contains
+# 'domains' (real new apex from newly_registered_domains_measurements;
+# excludes the CT-discovered FQDNs which can be 3k-42k/snap and would
+# blow through SPN quota). Result files (.jsonl + .summary.json) land on
+# the same parking-DAY-* release as the source delta.
+#
+# Requires repo secrets SPN_ACCESS_KEY and SPN_SECRET_KEY (from
+# https://archive.org/account/s3.php — free archive.org account).
+
+on:
+  workflow_run:
+    workflows: [parking-daily]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      snap_tag:
+        description: 'snap-YYYY-MM-DD-HH (empty = nearest preceding 12h boundary)'
+        required: false
+        default: ''
+      provider:
+        description: 'Provider name (delta filename uses this)'
+        required: false
+        default: 'parkingcrew'
+      dry_run:
+        description: 'If "true", read delta + print counts; do not submit'
+        required: false
+        default: 'false'
+      limit:
+        description: 'Cap submissions for testing (0 = no cap)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: parking-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Only fire on workflow_run if parking_daily succeeded.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute snap_tag
+        id: snap
+        env:
+          SNAP_INPUT: ${{ github.event.inputs.snap_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SNAP_INPUT:-}" ]; then
+            TAG="$SNAP_INPUT"
+          else
+            DAY=$(date -u +%F)
+            NOW_H=$(date -u +%H)
+            if [ "$((10#$NOW_H))" -lt 12 ]; then HOUR=00; else HOUR=12; fi
+            TAG="snap-${DAY}-${HOUR}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved snap_tag=$TAG"
+
+      - name: Setup duckdb
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+          curl -sS -L https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          unzip -q -o /tmp/duckdb.zip -d /usr/local/bin
+
+      - name: Submit to Internet Archive SPN
+        env:
+          GH_TOKEN:        ${{ github.token }}
+          GITHUB_RUN_URL:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SNAP_TAG:        ${{ steps.snap.outputs.tag }}
+          PROVIDER:        ${{ github.event.inputs.provider || 'parkingcrew' }}
+          DRY_RUN:         ${{ github.event.inputs.dry_run || 'false' }}
+          LIMIT:           ${{ github.event.inputs.limit || '0' }}
+          SPN_ACCESS_KEY:  ${{ secrets.SPN_ACCESS_KEY }}
+          SPN_SECRET_KEY:  ${{ secrets.SPN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          ARGS=("$SNAP_TAG"
+                "--provider" "$PROVIDER"
+                "--workdir" "$RUNNER_TEMP/parking-archive")
+          [ "$DRY_RUN" = "true" ]    && ARGS+=("--dry-run")
+          [ "$LIMIT" != "0" ]        && ARGS+=("--limit" "$LIMIT")
+          python3 -m scripts.parking_archive "${ARGS[@]}"
+
+      - name: Upload artifact on dry-run
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parking-archive-${{ steps.snap.outputs.tag }}
+          path: ${{ runner.temp }}/parking-archive/
+          retention-days: 7
