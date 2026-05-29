@@ -13,8 +13,10 @@ See docs/specs/2026-05-29-parking-tracking-design.md.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -265,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     date, hour = parse_snap_tag(args.snap_tag)
     print(f"snap_tag={args.snap_tag} date={date} hour={hour}", file=sys.stderr)
 
+    # tempdir is intentionally not cleaned up — GH Actions runner clears
+    # $RUNNER_TEMP on job exit; local dev can inspect outputs by hand.
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="parking-delta-"))
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"workdir={workdir} dry_run={args.dry_run}", file=sys.stderr)
@@ -295,7 +299,6 @@ def main(argv: list[str] | None = None) -> int:
     anti_join_sql = build_anti_join_sql(seen_paths)
     ct_sql = build_ct_signal_sql(args.snap_tag, args.shards_config, args.repo)
 
-    import subprocess
     t0 = time.time()
 
     # Phase 1: build today_new_ct + report counts.
@@ -323,7 +326,6 @@ COPY (
     subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
 
     # Parse counts.csv.
-    import csv
     counts: dict[str, int]    = {}
     ct_counts: dict[str, int] = {}
     with open(counts_file) as f:
