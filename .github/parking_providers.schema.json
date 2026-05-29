@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wangmm001/dns-tracking/.github/parking_providers.schema.json",
+  "title": "Parking provider configuration",
+  "type": "object",
+  "required": ["version", "providers"],
+  "properties": {
+    "version": { "const": 1 },
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "org", "active", "ns_suffix"],
+        "additionalProperties": false,
+        "properties": {
+          "name":      { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "org":       { "type": "string", "minLength": 1 },
+          "active":    { "type": "boolean" },
+          "watchlist": { "type": "boolean" },
+          "ns_suffix": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "^\\.[a-z0-9.-]+$" }
+          },
+          "note":         { "type": "string" },
+          "seeded_from":  { "type": "string", "pattern": "^snap-[0-9]{4}-[0-9]{2}-[0-9]{2}-(00|12)$" }
+        }
+      }
+    }
+  }
+}
