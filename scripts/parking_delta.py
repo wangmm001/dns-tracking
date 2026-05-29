@@ -25,6 +25,34 @@ from scripts.parking_common import (
 )
 
 
+def verify_snap_complete(snap_tag: str, shards_config: str, repo: str,
+                         retry_after_s: int = 300,
+                         max_retries: int = 1) -> None:
+    """Sleep+retry until all shards from shards.json have landed on the
+    snap-* release; raise after max_retries if still incomplete."""
+    from scripts.parking_common import gh_release_assets
+    expected_files = set()
+    cfg = json.load(open(shards_config))
+    for topic, meta in cfg.items():
+        for i in range(meta["shards"]):
+            expected_files.add(f"{topic}.shard-{i}.parquet")
+    for attempt in range(max_retries + 1):
+        have = set(gh_release_assets(snap_tag, repo))
+        missing = expected_files - have
+        if not missing:
+            print(f"snap_tag={snap_tag} complete ({len(have)} assets)",
+                  file=sys.stderr)
+            return
+        print(f"snap_tag={snap_tag} missing {len(missing)}: "
+              f"{sorted(missing)[:3]}…", file=sys.stderr)
+        if attempt == max_retries:
+            raise RuntimeError(
+                f"snap {snap_tag} still missing {len(missing)} shards after "
+                f"{attempt + 1} checks"
+            )
+        time.sleep(retry_after_s)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("snap_tag", help="snap-YYYY-MM-DD-HH")
@@ -56,7 +84,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"providers: {len(active)} active / {len(providers)} total",
           file=sys.stderr)
 
-    # Subsequent tasks add: shard verification, SQL execution, upload steps.
+    if not args.force_incomplete:
+        verify_snap_complete(args.snap_tag, args.shards_config, args.repo)
+    else:
+        print(f"--force-incomplete: skipping shard verification",
+              file=sys.stderr)
+
+    # Subsequent tasks add: SQL execution, upload steps.
     return 0
 
 
