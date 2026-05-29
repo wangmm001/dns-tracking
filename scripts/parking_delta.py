@@ -25,6 +25,54 @@ from scripts.parking_common import (
 )
 
 
+def build_today_ns_sql(snap_tag: str, shards_config: str, repo: str,
+                       active_providers: list) -> str:
+    """Return a SQL block that produces a `today_ns` temp table.
+
+    Columns: provider, domain, ns_set, source_topics, first_ms, last_ms,
+    observations.
+    """
+    urls = shard_urls(snap_tag, shards_config, repo)
+    avro_topics = [
+        "newly_registered_domains_measurements",
+        "newly_registered_fqdn_measurements",
+        "newly_issued_certificates_measurements",
+    ]
+    all_urls = [u for t in avro_topics for u in urls[t]]
+    url_list_sql = ",\n    ".join(f"'{u}'" for u in all_urls)
+
+    union_blocks = []
+    for prov in active_providers:
+        for suf in prov.ns_suffix:
+            union_blocks.append(
+                f"SELECT '{prov.name}' AS provider, topic, d, s, fs, ls, n "
+                f"FROM src WHERE k='ns' AND s IS NOT NULL "
+                f"AND d IS NOT NULL AND ends_with(s, '{suf}')"
+            )
+    union_sql = "\n  UNION ALL\n  ".join(union_blocks)
+
+    return f"""
+CREATE OR REPLACE TEMP TABLE today_ns AS
+WITH src AS (
+  SELECT * FROM read_parquet([
+    {url_list_sql}
+  ])
+),
+matched AS (
+  {union_sql}
+)
+SELECT provider,
+       d AS domain,
+       list_sort(array_agg(DISTINCT s))     AS ns_set,
+       list_sort(array_agg(DISTINCT topic)) AS source_topics,
+       MIN(fs) AS first_ms,
+       MAX(ls) AS last_ms,
+       SUM(n)  AS observations
+FROM matched
+GROUP BY provider, d;
+"""
+
+
 def verify_snap_complete(snap_tag: str, shards_config: str, repo: str,
                          retry_after_s: int = 300,
                          max_retries: int = 1) -> None:
@@ -90,8 +138,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--force-incomplete: skipping shard verification",
               file=sys.stderr)
 
-    # Subsequent tasks add: SQL execution, upload steps.
-    return 0
+    sql_file = workdir / "delta.sql"
+    today_ns_sql = build_today_ns_sql(
+        args.snap_tag, args.shards_config, args.repo, active,
+    )
+    counts_sql = (
+        "SELECT provider, COUNT(*) AS new_today "
+        "FROM today_ns GROUP BY provider ORDER BY new_today DESC;"
+    )
+    sql_file.write_text(
+        "INSTALL httpfs; LOAD httpfs;\n"
+        "SET memory_limit='6GB';\n"
+        "SET enable_progress_bar=false;\n"
+        f"{today_ns_sql}\n"
+        f"{counts_sql}\n"
+    )
+    print(f"wrote SQL to {sql_file}", file=sys.stderr)
+
+    if args.dry_run:
+        # Quick correctness check: execute and print counts.
+        import subprocess
+        subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
+        return 0
 
 
 if __name__ == "__main__":
