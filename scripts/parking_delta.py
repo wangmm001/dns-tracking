@@ -73,6 +73,41 @@ GROUP BY provider, d;
 """
 
 
+def build_export_sql(workdir: Path, active_providers: list) -> str:
+    """Generate one COPY TO parquet + one COPY TO jsonl per provider."""
+    blocks = []
+    for prov in active_providers:
+        blocks.append(f"""
+COPY (
+  SELECT * FROM today_new_ct WHERE provider = '{prov.name}'
+) TO '{workdir}/delta.{prov.name}.parquet'
+  (FORMAT 'parquet', COMPRESSION 'zstd');
+
+COPY (
+  SELECT * FROM today_new_ct WHERE provider = '{prov.name}'
+) TO '{workdir}/delta.{prov.name}.jsonl'
+  (FORMAT 'json');
+""")
+    return "\n".join(blocks)
+
+
+def write_manifest(workdir: Path, snap_tag: str, runtime_s: float,
+                   config_version: int, counts: dict[str, int]) -> Path:
+    manifest = workdir / "manifest.json"
+    obj = {
+        "snap_tag":       snap_tag,
+        "config_version": config_version,
+        "runtime_s":      round(runtime_s, 1),
+        "run_id":         os.environ.get("GITHUB_RUN_URL", ""),
+        "providers": [
+            {"name": name, "new_domains": cnt}
+            for name, cnt in sorted(counts.items(), key=lambda kv: -kv[1])
+        ],
+    }
+    manifest.write_text(json.dumps(obj, indent=2))
+    return manifest
+
+
 def build_ct_signal_sql(snap_tag: str, shards_config: str, repo: str) -> str:
     """Add ct_sources and ct_fingerprints to today_new via apex-level
     LEFT JOIN with certstream_domains in the same snap.
@@ -224,14 +259,11 @@ def main(argv: list[str] | None = None) -> int:
 
     anti_join_sql = build_anti_join_sql(seen_paths)
     ct_sql = build_ct_signal_sql(args.snap_tag, args.shards_config, args.repo)
-    counts_sql = """
-SELECT provider,
-       COUNT(*) AS new_today,
-       COUNT(*) FILTER (WHERE len(ct_sources) > 0) AS with_ct_signal
-FROM today_new_ct
-GROUP BY provider
-ORDER BY new_today DESC;
-"""
+
+    import subprocess
+    t0 = time.time()
+
+    # Phase 1: build today_new_ct + report counts.
     sql_file.write_text(
         "INSTALL httpfs; LOAD httpfs;\n"
         "SET memory_limit='6GB';\n"
@@ -239,13 +271,35 @@ ORDER BY new_today DESC;
         f"{today_ns_sql}\n"
         f"{anti_join_sql}\n"
         f"{ct_sql}\n"
-        f"{counts_sql}\n"
     )
+
+    # Phase 2: export per-provider files.
+    export_sql = build_export_sql(workdir, active)
+    counts_file = workdir / "counts.csv"
+    sql_file.write_text(sql_file.read_text() + export_sql + f"""
+COPY (
+  SELECT provider, COUNT(*) AS new_today
+  FROM today_new_ct GROUP BY provider
+) TO '{counts_file}' (HEADER, FORMAT 'csv');
+""")
     print(f"wrote SQL to {sql_file}", file=sys.stderr)
+    subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
+
+    # Parse counts.csv.
+    import csv
+    with open(counts_file) as f:
+        counts = {row["provider"]: int(row["new_today"]) for row in csv.DictReader(f)}
+    # Provider with zero new domains: csv has no row; backfill 0.
+    for p in active:
+        counts.setdefault(p.name, 0)
+
+    runtime = time.time() - t0
+    cfg_version = json.load(open(args.config))["version"]
+    manifest = write_manifest(workdir, args.snap_tag, runtime, cfg_version, counts)
+    print(f"wrote {manifest}", file=sys.stderr)
 
     if args.dry_run:
-        import subprocess
-        subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
+        print(f"DRY RUN: outputs in {workdir}", file=sys.stderr)
         return 0
 
 
