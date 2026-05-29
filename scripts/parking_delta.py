@@ -323,7 +323,10 @@ COPY (
 ) TO '{counts_file}' (HEADER, FORMAT 'csv');
 """)
     print(f"wrote SQL to {sql_file}", file=sys.stderr)
-    subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
+    # Read SQL via stdin (not -f): the -f flag was added in DuckDB CLI 1.4;
+    # the GH Actions runner pins an older version that treats the path as a DB.
+    with open(sql_file) as fh:
+        subprocess.run(["duckdb"], stdin=fh, check=True)
 
     # Parse counts.csv.
     counts: dict[str, int]    = {}
@@ -373,7 +376,8 @@ COPY (
         # since the previous one exited; for now, re-run the full SQL chain.
         + sql_file.read_text() + seen_sql
     )
-    subprocess.run(["duckdb", "-f", str(seen_sql_file)], check=True)
+    with open(seen_sql_file) as fh:
+        subprocess.run(["duckdb"], stdin=fh, check=True)
 
     # Atomic upload: rename .new → seen-YYYY.parquet and upload with --clobber.
     final = workdir / f"seen-{year}.parquet"

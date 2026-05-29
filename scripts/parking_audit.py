@@ -165,7 +165,10 @@ def main(argv=None) -> int:
                          args.topk, topk_path)
     sql_file = workdir / "audit.sql"
     sql_file.write_text(sql)
-    subprocess.run(["duckdb", "-f", str(sql_file)], check=True)
+    # Read SQL via stdin (not -f): the -f flag was added in DuckDB CLI 1.4;
+    # the GH Actions runner pins an older version that treats the path as a DB.
+    with open(sql_file) as fh:
+        subprocess.run(["duckdb"], stdin=fh, check=True)
 
     providers = load_providers(args.config)
     report, unhandled_count = render_report(topk_path, providers, args.window_days, tags)
