@@ -1,0 +1,109 @@
+name: parking-daily
+
+# Per-snap parking-NS delta producer. Reads the most-recent snap-YYYY-MM-DD-HH
+# release after retry.yml has settled, filters by ns_suffix per
+# .github/parking_providers.json, anti-joins against the cumulative seen state
+# in `parking-state`, LEFT-JOINs CT signal, and uploads per-provider delta
+# assets to `parking-DAY-YYYY-MM-DD-HH`.
+#
+# Triggers (belt-and-suspenders):
+#   - cron: 05:00 / 17:00 UTC (30min after retry.yml)
+#   - workflow_run: when retry.yml completes successfully
+#   - workflow_dispatch with optional snap_tag and dry_run inputs
+#
+# Concurrency: serialized via `parking` group so cron+workflow_run never race
+# on seen.parquet. The second to fire is idempotent (anti-join → empty delta).
+
+on:
+  schedule:
+    - cron: '0 5,17 * * *'
+  workflow_run:
+    workflows: [retry-missing-shards]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      snap_tag:
+        description: 'snap-YYYY-MM-DD-HH (empty = nearest preceding 12h boundary)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'If "true", skip state download and uploads; outputs as artifact'
+        required: false
+        default: 'false'
+      force_incomplete:
+        description: 'If "true", run even if snap-* release is missing shards'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: parking
+  cancel-in-progress: false
+
+jobs:
+  delta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute snap_tag
+        id: snap
+        env:
+          SNAP_INPUT: ${{ github.event.inputs.snap_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SNAP_INPUT:-}" ]; then
+            TAG="$SNAP_INPUT"
+          else
+            DAY=$(date -u +%F)
+            NOW_H=$(date -u +%H)
+            if [ "$((10#$NOW_H))" -lt 12 ]; then HOUR=00; else HOUR=12; fi
+            TAG="snap-${DAY}-${HOUR}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved snap_tag=$TAG"
+
+      - name: Setup Python + duckdb + jsonschema
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+          # DuckDB CLI (pinned major.minor)
+          curl -sS -L https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          unzip -q -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+          python3 -m pip install --quiet jsonschema pyarrow
+
+      - name: Validate parking_providers.json against schema
+        run: |
+          python3 - <<'PY'
+          import json, jsonschema, sys
+          cfg    = json.load(open('.github/parking_providers.json'))
+          schema = json.load(open('.github/parking_providers.schema.json'))
+          jsonschema.validate(cfg, schema)
+          print(f"OK: {len(cfg['providers'])} providers")
+          PY
+
+      - name: Run parking_delta.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
+          FORCE_INCOMPLETE: ${{ github.event.inputs.force_incomplete || 'false' }}
+          SNAP_TAG:         ${{ steps.snap.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ARGS=("$SNAP_TAG" "--workdir" "$RUNNER_TEMP/parking-delta")
+          [ "$DRY_RUN" = "true" ]          && ARGS+=("--dry-run")
+          [ "$FORCE_INCOMPLETE" = "true" ] && ARGS+=("--force-incomplete")
+          python3 -m scripts.parking_delta "${ARGS[@]}"
+
+      - name: Upload artifact on dry-run
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parking-delta-${{ steps.snap.outputs.tag }}
+          path: ${{ runner.temp }}/parking-delta/
+          retention-days: 7
