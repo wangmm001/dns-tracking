@@ -30,6 +30,9 @@ def parse_args(argv=None):
     p.add_argument("--shards-config", default=".github/shards.json")
     p.add_argument("--window-days", type=int, default=30)
     p.add_argument("--topk", type=int, default=500)
+    p.add_argument("--memory-limit", default="8GB",
+                   help="DuckDB memory_limit; the rest of the working set "
+                        "spills to --workdir (ubuntu-latest has 16 GB)")
     p.add_argument("--audit-release-prefix", default="parking-audit-")
     p.add_argument("--workdir", default=None)
     p.add_argument("--dry-run", action="store_true",
@@ -56,33 +59,62 @@ def recent_snap_tags(repo: str, days: int) -> list[str]:
 
 
 def build_topk_sql(tags: list[str], shards_config: str, repo: str,
-                   topk: int, out_path: Path) -> str:
+                   topk: int, out_path: Path, temp_dir: Path,
+                   memory_limit: str = "8GB") -> str:
     urls = []
     for tag in tags:
         urls.extend(shard_urls(tag, shards_config, repo)["newly_registered_domains_measurements"])
     url_list = ",\n    ".join(f"'{u}'" for u in urls)
+    scan = f"""FROM read_parquet([{url_list}])
+WHERE k='ns' AND s IS NOT NULL AND d IS NOT NULL"""
+    apex = "array_to_string(list_slice(string_split(s, '.'), -2, -1), '.')"
+    # Memory discipline. The single-statement version of this query OOM'd at
+    # 5.5 GiB in 2026-07 and 2026-08, because COUNT(DISTINCT ...) and
+    # array_agg(DISTINCT d ORDER BY d) build per-group state that DuckDB pins
+    # and cannot spill; that state grows with the window, so no fixed limit
+    # survives a 30-day one. Instead:
+    #   * de-duplicate with GROUP BY, which does spill, into on-disk tables,
+    #     then COUNT(*) the rows;
+    #   * min(d, 5) keeps only the five smallest per group, replacing an
+    #     array_agg that materialised and sorted every distinct domain per
+    #     apex just to slice five off the front.
+    # Deriving both tables straight from the scan costs a second pass over the
+    # release parquets, but parquet column pruning makes each pass ~4 minutes
+    # for 660 shards -- far cheaper than de-duplicating (ns_apex, d, s) triples
+    # first, which is a larger intermediate than either table it feeds.
     return f"""
 INSTALL httpfs; LOAD httpfs;
-SET memory_limit='6GB';
+SET memory_limit='{memory_limit}';
+SET temp_directory='{temp_dir}';
+SET preserve_insertion_order=false;
 SET enable_progress_bar=false;
+
+CREATE OR REPLACE TABLE apex_domain AS
+SELECT {apex} AS ns_apex, d
+{scan}
+GROUP BY ALL;
+
+CREATE OR REPLACE TABLE apex_host AS
+SELECT {apex} AS ns_apex, s
+{scan}
+GROUP BY ALL;
+
 COPY (
-  WITH base AS (
-    SELECT d, s FROM read_parquet([{url_list}])
-    WHERE k='ns' AND s IS NOT NULL AND d IS NOT NULL
-  ),
-  labeled AS (
-    SELECT d, s,
-           array_to_string(list_slice(string_split(s, '.'), -2, -1), '.') AS ns_apex
-    FROM base
-  )
-  SELECT ns_apex,
-         COUNT(DISTINCT d) AS new_domains,
-         COUNT(DISTINCT s) AS distinct_ns_hosts,
-         any_value(s)      AS sample_ns_host,
-         (array_agg(DISTINCT d ORDER BY d))[1:5] AS sample_domains
-  FROM labeled
-  GROUP BY ns_apex
-  ORDER BY new_domains DESC
+  SELECT ad.ns_apex,
+         ad.new_domains,
+         ah.distinct_ns_hosts,
+         ah.sample_ns_host,
+         ad.sample_domains
+  FROM (
+    SELECT ns_apex, COUNT(*) AS new_domains, min(d, 5) AS sample_domains
+    FROM apex_domain GROUP BY ns_apex
+  ) ad
+  JOIN (
+    SELECT ns_apex, COUNT(*) AS distinct_ns_hosts, min(s) AS sample_ns_host
+    FROM apex_host GROUP BY ns_apex
+  ) ah USING (ns_apex)
+  -- ns_apex breaks ties so the monthly report diffs cleanly run to run.
+  ORDER BY new_domains DESC, ns_apex
   LIMIT {topk}
 ) TO '{out_path}' (FORMAT 'parquet', COMPRESSION 'zstd');
 """
@@ -161,14 +193,23 @@ def main(argv=None) -> int:
           f"({tags[0]} → {tags[-1]})", file=sys.stderr)
 
     topk_path = workdir / "topk_ns.parquet"
+    temp_dir = workdir / "duckdb_tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
     sql = build_topk_sql(tags, args.shards_config, args.repo,
-                         args.topk, topk_path)
+                         args.topk, topk_path, temp_dir, args.memory_limit)
     sql_file = workdir / "audit.sql"
     sql_file.write_text(sql)
+    # Run against an on-disk database, not the default in-memory one: the
+    # de-duplicated intermediates are the bulk of the working set and belong
+    # on the runner's disk. Start from a clean file so CREATE OR REPLACE never
+    # inherits a half-written table from an interrupted run.
+    db_path = workdir / "audit.duckdb"
+    for stale in (db_path, db_path.with_suffix(".duckdb.wal")):
+        stale.unlink(missing_ok=True)
     # Read SQL via stdin (not -f): the -f flag was added in DuckDB CLI 1.4;
     # the GH Actions runner pins an older version that treats the path as a DB.
     with open(sql_file) as fh:
-        subprocess.run(["duckdb"], stdin=fh, check=True)
+        subprocess.run(["duckdb", str(db_path)], stdin=fh, check=True)
 
     providers = load_providers(args.config)
     report, unhandled_count = render_report(topk_path, providers, args.window_days, tags)
