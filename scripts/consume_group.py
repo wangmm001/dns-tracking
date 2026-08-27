@@ -206,6 +206,21 @@ def compute_shard_range(consumer, topic, start_ms, end_ms, shard_idx, shard_coun
         end_off = ends[0].offset
     start_off = starts[0].offset
 
+    if end_off == start_off:
+        # Past retention (or a window entirely in the future): the broker has
+        # nothing for this time range. Without this guard the consumer happily
+        # reads 0 messages, writes a 2 KB schema-only parquet, exits 0, and the
+        # workflow uploads it — which is worse than the gap it "fills":
+        # retry-missing-shards counts Release assets, so a 0-row shard makes the
+        # snap look complete and hides the hole from the only thing that watches
+        # for it. Fail loudly instead and let the shard stay visibly missing.
+        raise RuntimeError(
+            f"{topic} shard {shard_idx}/{shard_count}: window "
+            f"[{start_ms}..{end_ms}] resolved to an empty offset range at "
+            f"{start_off} — broker retains no messages for it. Refusing to emit "
+            f"a 0-row parquet."
+        )
+
     total = end_off - start_off
     chunk = total // shard_count
     shard_start = start_off + shard_idx * chunk
