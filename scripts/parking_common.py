@@ -7,8 +7,10 @@ parking_delta.py / parking_audit.py.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -109,7 +111,24 @@ def gh_download_asset(tag: str, asset: str, dest_dir: str,
 
 def gh_upload_assets(tag: str, files: Sequence[str],
                      repo: str = REPO_DEFAULT, title: str | None = None) -> None:
-    """Create or update `tag` release, upload files with --clobber."""
+    """Create or update `tag` release, upload non-empty files with --clobber.
+
+    Zero-byte files are skipped. `gh release upload` rejects them with
+    "HTTP 400: Bad Content-Length", which turned every no-op run red:
+    parking-archive fires twice per snap (parking-daily has both its own cron
+    and a workflow_run cascade from retry-missing-shards), and the second run
+    correctly finds nothing left to submit, writes an empty .jsonl, then died
+    uploading it. Skipping is also the safer clobber: an empty file must never
+    overwrite a good asset that an earlier run already uploaded.
+    """
+    payload, empty = [], []
+    for f in files:
+        (payload if os.path.getsize(f) > 0 else empty).append(f)
+    for f in empty:
+        print(f"skip empty asset: {f}", file=sys.stderr)
+    if not payload:
+        print(f"no non-empty assets for {tag}; skipping upload", file=sys.stderr)
+        return
     proc = subprocess.run(
         ["gh", "release", "view", tag, "-R", repo],
         capture_output=True,
@@ -121,6 +140,6 @@ def gh_upload_assets(tag: str, files: Sequence[str],
             check=True,
         )
     subprocess.run(
-        ["gh", "release", "upload", tag, *files, "-R", repo, "--clobber"],
+        ["gh", "release", "upload", tag, *payload, "-R", repo, "--clobber"],
         check=True,
     )
