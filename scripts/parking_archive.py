@@ -186,6 +186,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--limit={args.limit} applied, will submit {len(domains)}",
               file=sys.stderr)
 
+    # No new-apex domains this cycle: writing an empty archive.{provider}.jsonl
+    # and uploading it makes `gh release upload` fail with HTTP 400 Bad
+    # Content-Length (GitHub rejects 0-byte release assets). Nothing to submit,
+    # so skip the SPN loop + upload entirely and exit cleanly.
+    if not domains:
+        print("no new-apex domains this cycle; skip submit + upload",
+              file=sys.stderr)
+        return 0
+
     if args.dry_run:
         print(f"DRY RUN: first 10 = {domains[:10]}", file=sys.stderr)
         print(f"DRY RUN: outputs in {workdir}", file=sys.stderr)
